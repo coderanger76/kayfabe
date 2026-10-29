@@ -1,0 +1,1863 @@
+#!/usr/bin/env python3
+"""kayfabe - a terminal that looks like someone is working very hard.
+
+Everything here is theater. It prints made-up commands and made-up output
+(git, npm, docker, pytest, kubectl, terraform, vim, htop, stack traces...)
+with realistic typing and timing. It never touches the network, never runs a
+subprocess, never reads or writes files, and discards anything you type.
+
+    ./kayfabe              run it (Ctrl+C to quit)
+    ./kayfabe --speed 2    twice as fast (0.5 = slower)
+
+Python 3.8+ standard library only, so it runs on any stock Mac.
+"""
+import argparse
+import atexit
+import getpass
+import platform
+import random
+import re
+import select
+import shutil
+import socket
+import sys
+import time
+
+try:
+    import termios
+except ImportError:  # not a unix tty; still runs, just without echo control
+    termios = None
+
+# ---------------------------------------------------------------- plumbing
+
+SPEED = 1.0
+ANSI = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def sgr(*c):
+    return "\033[" + ";".join(str(x) for x in c) + "m"
+
+
+def fg(n):
+    return "\033[38;5;%dm" % n
+
+
+R, B, DIM, INV = sgr(0), sgr(1), sgr(2), sgr(7)
+RED, GREEN, YELLOW, BLUE = fg(203), fg(114), fg(221), fg(75)
+MAGENTA, CYAN, ORANGE, GREY = fg(177), fg(80), fg(215), fg(244)
+
+
+class State:
+    pass
+
+
+S = State()
+S.user = getpass.getuser()
+S.host = socket.gethostname().split(".")[0]
+S.queue = []
+S.recent = []
+S.alt = False
+S.dirty = True
+S.remote = None
+S.tty = sys.stdin.isatty() and sys.stdout.isatty()
+S.saved_tty = None
+
+
+def out(s):
+    sys.stdout.write(s)
+    sys.stdout.flush()
+
+
+def nap(a, b=None):
+    t = a if b is None else random.uniform(a, b)
+    time.sleep(t / SPEED)
+
+
+def ri(a, b):
+    return random.randint(a, max(a, b))
+
+
+def sha(n=7):
+    return "".join(random.choices("0123456789abcdef", k=n))
+
+
+def term_w():
+    return shutil.get_terminal_size((100, 30)).columns
+
+
+def term_h():
+    return shutil.get_terminal_size((100, 30)).lines
+
+
+def now_utc():
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".%03dZ" % ri(0, 999)
+
+
+def line(s="", d=0.02):
+    out(s + "\n")
+    nap(d * 0.6, d * 1.6)
+
+
+def bar(frac, w=30, full="█", empty="░"):
+    n = int(max(0.0, min(1.0, frac)) * w)
+    return full * n + empty * (w - n)
+
+
+def rule(text, color, ch="="):
+    w = min(term_w(), 100)
+    t = " %s " % text if text else ""
+    left = (w - len(t)) // 2
+    line("%s%s%s%s%s" % (color, ch * left, t, ch * (w - left - len(t)), R), 0.01)
+
+
+def spin(label_fn, secs, color=CYAN):
+    t0 = time.time()
+    i = 0
+    while (time.time() - t0) * SPEED < secs:
+        out("\r%s%s%s %s\033[K" % (color, SPIN[i % len(SPIN)], R, label_fn()))
+        i += 1
+        time.sleep(0.08 / SPEED)
+    out("\r\033[K")
+
+
+def pct(label, total, tail=""):
+    """git-style 'label: 42% (12/30)' counter that ends with ', done.'"""
+    steps = ri(5, 12)
+    for i in range(1, steps):
+        out("\r%s: %3d%% (%d/%d)" % (label, i * 100 // steps, total * i // steps, total))
+        nap(0.04, 0.18)
+    out("\r%s: 100%% (%d/%d)%s, done.\n" % (label, total, total, tail))
+    nap(0.05)
+
+
+def progress(label, secs, w=28):
+    steps = ri(12, 24)
+    for i in range(steps + 1):
+        f = i / steps
+        out("\r%s %s%s%s %3d%%\033[K" % (label, GREEN, bar(f, w), R, int(f * 100)))
+        nap(secs / steps * 0.5, secs / steps * 1.5)
+    out("\n")
+
+
+# -------------------------------------------------------------- typing
+
+def _type_plain(t, base):
+    for ch in t:
+        out(ch)
+        if ch == " ":
+            d = random.uniform(0.01, 0.05)
+        else:
+            d = random.uniform(base * 0.3, base * 1.8)
+        if random.random() < 0.03:
+            d += random.uniform(0.1, 0.35)
+        time.sleep(d / SPEED)
+
+
+def type_text(s, base=0.045):
+    pos = 0
+    for m in ANSI.finditer(s):
+        _type_plain(s[pos:m.start()], base)
+        out(m.group())
+        pos = m.end()
+    _type_plain(s[pos:], base)
+
+
+def prompt():
+    if S.remote:
+        return S.remote
+    dirty = YELLOW + "✗" + R + " " if S.dirty else ""
+    return "%s➜%s  %s%s%s %s%sgit:(%s%s%s)%s %s" % (
+        GREEN, R, B, CYAN, S.proj, R + B, BLUE, RED, S.branch, BLUE, R, dirty)
+
+
+def type_cmd(cmd, pr=None):
+    out(prompt() if pr is None else pr)
+    nap(0.3, 1.2)
+    if len(cmd) > 10 and random.random() < 0.07:
+        p = ri(4, len(cmd) - 3)
+        type_text(cmd[:p] + random.choice("qwertyuiopasdf"))
+        nap(0.3, 0.7)
+        out("\b \b")
+        nap(0.1, 0.3)
+        type_text(cmd[p:])
+    else:
+        type_text(cmd)
+    nap(0.15, 0.5)
+    out("\n")
+
+
+# ---------------------------------------------------- the user interrupts
+
+def set_echo(on):
+    if not (S.tty and termios):
+        return
+    try:
+        a = termios.tcgetattr(0)
+        if on:
+            a[3] |= termios.ECHO
+        else:
+            a[3] &= ~termios.ECHO
+        termios.tcsetattr(0, termios.TCSADRAIN, a)
+    except Exception:
+        pass
+
+
+def ask(text, auto="y", secret=False, wait=(4.0, 8.0)):
+    """Print a prompt and give the human a few beats to answer. If they stay
+    silent, 'type' the auto answer ourselves and carry on. Input is discarded."""
+    out(text)
+    t = random.uniform(*wait)
+    ans = None
+    if S.tty:
+        try:
+            termios.tcflush(0, termios.TCIFLUSH)
+        except Exception:
+            pass
+        set_echo(not secret)
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], t / SPEED)
+            if ready:
+                ans = sys.stdin.readline()
+        except (EOFError, ValueError, OSError):
+            ans = ""
+        set_echo(False)
+        try:
+            termios.tcflush(0, termios.TCIFLUSH)
+        except Exception:
+            pass
+        if ans is not None and not secret and not ans.endswith("\n"):
+            out("\n")
+    else:
+        nap(t)
+    if ans is None:  # nobody answered
+        if secret:
+            nap(0.8, 1.8)
+        else:
+            type_text(auto)
+            nap(0.2, 0.6)
+        out("\n")
+        ans = auto
+    nap(0.3, 0.8)
+    return ans
+
+
+def cleanup():
+    if S.alt:
+        out("\033[?1049l")
+        S.alt = False
+    out("\033[?25h" + R)
+    if S.saved_tty and termios:
+        try:
+            termios.tcsetattr(0, termios.TCSADRAIN, S.saved_tty)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------- the world
+
+PROJECTS = [
+    ("atlas-web", "node", "acme-labs"),
+    ("pulse-dashboard", "node", "northwind"),
+    ("ledger-api", "python", "helix-systems"),
+    ("quant-engine", "python", "brightpath"),
+    ("orion-core", "rust", "acme-labs"),
+    ("beacon-ingest", "go", "vantage-io"),
+    ("infra-live", "infra", "northwind"),
+]
+
+FILES = {
+    "node": ["src/components/Header.tsx", "src/hooks/useSession.ts", "src/api/client.ts",
+             "src/pages/checkout.tsx", "src/store/cartSlice.ts", "vite.config.ts",
+             "src/components/OrderTable.tsx", "package.json"],
+    "python": ["app/auth/session.py", "app/api/orders.py", "app/ledger/reconcile.py",
+               "app/workers/billing.py", "app/models/account.py", "app/settings.py",
+               "tests/test_auth.py", "pyproject.toml"],
+    "rust": ["src/server.rs", "src/handlers/auth.rs", "src/db/pool.rs", "src/config.rs",
+             "src/telemetry.rs", "src/queue/consumer.rs", "Cargo.toml"],
+    "go": ["cmd/server/main.go", "internal/ingest/batcher.go", "internal/queue/kafka.go",
+           "internal/metrics/prom.go", "internal/store/pg.go", "go.mod"],
+    "infra": ["modules/vpc/main.tf", "modules/eks/node_groups.tf", "envs/prod/main.tf",
+              "modules/rds/variables.tf", "k8s/api/deployment.yaml", ".github/workflows/plan.yml"],
+}
+
+COMMITS = [
+    "fix: handle null session in token refresh", "feat(api): add pagination to /v2/orders",
+    "refactor: extract retry logic into middleware", "chore: bump dependencies",
+    "perf: cache feature flag lookups", "fix(ci): pin runtime version in workflow",
+    "test: add regression for rate limiter", "docs: update runbook for failover",
+    "fix: race condition in batch flush", "feat: structured logging with request ids",
+    "fix(deps): resolve peer dependency conflict", "chore(release): cut 2.%d.0",
+]
+
+_TYPES = ["fix", "feat", "refactor", "perf", "chore", "test", "docs", "fix", "feat"]
+_SCOPES = ["", "", "api", "auth", "ci", "deps", "db", "cache", "ui", "queue", "billing", "logging"]
+_VERBS = ["handle", "add", "remove", "cache", "retry", "validate", "batch", "extract", "rename", "tighten", "guard", "stream"]
+_OBJS = ["null session in token refresh", "pagination to /v2/orders", "retry logic into middleware",
+         "feature flag lookups", "race in batch flush", "peer dependency conflict", "rate limiter edge case",
+         "connection pool leak", "timezone handling in reports", "webhook signature check", "empty cart on checkout",
+         "stale cache after deploy", "N+1 query in order list", "request ids in logs", "unused config flags",
+         "idempotency keys", "currency rounding", "health check timeout", "CORS headers", "graceful shutdown"]
+
+
+def commit_msg():
+    if random.random() < 0.15:
+        return "chore(release): cut 2.%d.0" % ri(1, 40)
+    t, sc = random.choice(_TYPES), random.choice(_SCOPES)
+    return "%s%s: %s %s" % (t, "(%s)" % sc if sc else "", random.choice(_VERBS), random.choice(_OBJS))
+
+
+SERVICES = ["api", "worker", "ingest", "auth", "billing", "gateway", "scheduler"]
+BRANCHES = ["main", "main", "develop", "feature/oauth-refresh", "fix/batch-flush-race",
+            "feature/pagination", "chore/dep-bumps"]
+
+
+DOMAINS = {"acme-labs": "acmelabs.io", "northwind": "northwind.dev", "helix-systems": "helixsys.com",
+           "brightpath": "brightpath.io", "vantage-io": "vantage.io"}
+ACCT = "".join(random.choices("0123456789", k=12))
+REGION = "us-west-2"
+
+
+def rid(n=12):
+    return "".join(random.choices("abcdefghjkmnpqrstuvwxyz23456789", k=n))
+
+
+def switch_project(first=False):
+    choices = [p for p in PROJECTS if first or p[0] != S.proj]
+    S.proj, S.stack, S.org = random.choice(choices)
+    S.files = FILES[S.stack]
+    S.domain = DOMAINS[S.org]
+    S.branch = random.choice(BRANCHES)
+    S.dirty = random.random() < 0.5
+    type_cmd("cd ~/work/%s" % S.proj if first else "cd ../%s" % S.proj)
+    type_cmd("git log --oneline --graph -n 6")
+    names = [S.branch, "origin/" + S.branch]
+    for i in range(6):
+        head = ""
+        if i == 0:
+            head = " %s(%sHEAD -> %s%s%s, %s%s%s)%s" % (
+                YELLOW, CYAN, GREEN, names[0], YELLOW, RED, names[1], YELLOW, R)
+        msg = commit_msg()
+        line("%s*%s %s%s%s%s %s" % (RED, R, YELLOW, sha(), R, head, msg), 0.04)
+
+
+def diffstat(files):
+    w = max(len(f) for f in files)
+    ins = dele = 0
+    for f in files:
+        n = ri(2, 70)
+        a = ri(0, n)
+        b = n - a
+        ins += a
+        dele += b
+        sa = max(1 if a else 0, round(a * 30 / 70))
+        sb = max(1 if b else 0, round(b * 30 / 70))
+        line(" %s | %3d %s%s%s%s%s" % (f.ljust(w), n, GREEN, "+" * sa, RED, "-" * sb, R), 0.03)
+    line(" %d file%s changed, %d insertions(+), %d deletions(-)" % (
+        len(files), "s" if len(files) > 1 else "", ins, dele))
+
+
+# ------------------------------------------------------------------ git
+
+def sc_git_pull():
+    type_cmd("git pull --rebase origin %s" % S.branch)
+    n = ri(40, 320)
+    line("remote: Enumerating objects: %d, done." % n)
+    pct("remote: Counting objects", n)
+    c = ri(15, n // 2 + 10)
+    pct("remote: Compressing objects", c)
+    t = ri(c // 2 + 5, c + 30)
+    line("remote: Total %d (delta %d), reused %d (delta %d), pack-reused 0" % (
+        t, ri(10, t), ri(0, t), ri(0, 30)))
+    pct("Unpacking objects", t, ", %d.%d KiB | %d.%d MiB/s" % (ri(8, 400), ri(10, 99), ri(1, 9), ri(10, 99)))
+    line("From github.com:%s/%s" % (S.org, S.proj))
+    line(" * branch            %-10s -> FETCH_HEAD" % S.branch)
+    line("   %s..%s  %s -> origin/%s" % (sha(), sha(), S.branch, S.branch))
+    if random.random() < 0.5:
+        line("Successfully rebased and updated refs/heads/%s." % S.branch)
+    else:
+        line("Updating %s..%s" % (sha(), sha()))
+        line("Fast-forward")
+        diffstat(random.sample(S.files, ri(2, min(6, len(S.files)))))
+
+
+def sc_git_commit_push():
+    files = random.sample(S.files, ri(2, min(5, len(S.files))))
+    type_cmd("git status -s")
+    for f in files:
+        line(" %sM%s %s" % (RED, R, f), 0.03)
+    type_cmd("git add -A")
+    msg = commit_msg()
+    type_cmd('git commit -m "%s"' % msg)
+    line("[%s %s] %s" % (S.branch, sha(), msg))
+    line(" %d files changed, %d insertions(+), %d deletions(-)" % (len(files), ri(5, 180), ri(1, 60)))
+    S.dirty = False
+    new = S.branch != "main" and random.random() < 0.6
+    type_cmd("git push%s origin %s" % (" -u" if new else "", S.branch))
+    n = ri(8, 30)
+    line("Enumerating objects: %d, done." % n)
+    pct("Counting objects", n)
+    pct("Delta compression using up to 10 threads\rCompressing objects", n - 3)
+    pct("Writing objects", n - 2, ", %d.%d KiB | %d.%d MiB/s" % (ri(1, 40), ri(10, 99), ri(1, 9), ri(10, 99)))
+    line("Total %d (delta %d), reused 0 (delta 0), pack-reused 0" % (n - 2, ri(3, 12)))
+    d = ri(3, 12)
+    line("remote: Resolving deltas: 100%% (%d/%d), completed with %d local objects." % (d, d, ri(2, 8)))
+    if new:
+        line("remote: ")
+        line("remote: Create a pull request for '%s' on GitHub by visiting:" % S.branch)
+        line("remote:      https://github.com/%s/%s/pull/new/%s" % (S.org, S.proj, S.branch))
+        line("remote: ")
+    line("To github.com:%s/%s.git" % (S.org, S.proj))
+    if new:
+        line(" * [new branch]      %s -> %s" % (S.branch, S.branch))
+        line("branch '%s' set up to track 'origin/%s'." % (S.branch, S.branch))
+    else:
+        line("   %s..%s  %s -> %s" % (sha(), sha(), S.branch, S.branch))
+
+
+def sc_merge_conflict():
+    f = random.choice(S.files)
+    type_cmd("git merge origin/develop")
+    line("Auto-merging %s" % random.choice(S.files))
+    line("Auto-merging %s" % f)
+    line("%sCONFLICT (content)%s: Merge conflict in %s" % (RED, R, f))
+    line("Automatic merge failed; fix conflicts and then commit the result.")
+    ans = ask("%s?%s Take upstream (theirs) for %s? %s[Y/n]%s " % (B + CYAN, R, f, DIM, R), "y")
+    if ans.strip().lower().startswith("n"):
+        line("Keeping local changes, will rebase hunks manually.")
+    type_cmd("git checkout --theirs %s && git add %s" % (f, f))
+    type_cmd("git commit --no-edit")
+    line("[%s %s] Merge remote-tracking branch 'origin/develop' into %s" % (S.branch, sha(), S.branch))
+    S.dirty = False
+
+
+# --------------------------------------------------------------- package
+
+NPM_PKGS = ["lodash", "react-dom", "@babel/core", "webpack", "esbuild", "zod", "axios",
+            "@tanstack/react-query", "typescript", "tailwindcss", "postcss", "eslint",
+            "@types/node", "vite", "date-fns", "rollup", "swr", "ws", "chalk"]
+NPM_DEPRECATED = [
+    "inflight@1.0.6: This module is not supported, and leaks memory. Do not use it.",
+    "glob@7.2.3: Glob versions prior to v9 are no longer supported",
+    "rimraf@3.0.2: Rimraf versions prior to v4 are no longer supported",
+    "@humanwhocodes/config-array@0.11.14: Use @eslint/config-array instead",
+    "uuid@3.4.0: Please upgrade to version 7 or higher.",
+    "querystring@0.2.0: The querystring API is considered Legacy.",
+]
+
+
+def sc_npm():
+    type_cmd(random.choice(["npm install", "npm ci"]))
+    for p in random.sample(NPM_DEPRECATED, ri(1, 3)):
+        nap(0.3, 0.9)
+        line("%snpm warn%s deprecated %s" % (YELLOW, R, p))
+    spin(lambda: "reify:%s: timing reifyNode:node_modules/%s" % (
+        random.choice(NPM_PKGS), random.choice(NPM_PKGS)), ri(2, 4))
+    n = ri(400, 1700)
+    line()
+    line("added %d packages, and audited %d packages in %ds" % (n, n + 1, ri(5, 28)))
+    line()
+    line("%d packages are looking for funding" % ri(80, 300))
+    line("  run `npm fund` for details")
+    line()
+    if random.random() < 0.6:
+        m, h = ri(1, 3), ri(0, 4)
+        line("%s%d vulnerabilities%s (%d moderate, %d high)" % (YELLOW, m + h, R, m, h))
+        line()
+        line("To address all issues, run:")
+        line("  npm audit fix")
+        line()
+        line("Run `npm audit` for details.")
+    else:
+        line("found %s0%s vulnerabilities" % (GREEN, R))
+
+
+def sc_vite():
+    type_cmd("npm run build")
+    line()
+    line("> %s@2.%d.%d build" % (S.proj, ri(1, 20), ri(0, 9)))
+    line("> vite build")
+    line()
+    line("%svite v5.%d.%d%s building for production..." % (CYAN, ri(0, 4), ri(0, 12), R))
+    spin(lambda: "transforming (%d) src/%s" % (ri(1, 900), random.choice(S.files[:5]).split("/", 1)[-1]), 2.5)
+    line("%s✓%s %d modules transformed." % (GREEN, R, ri(300, 2400)))
+    line("%sdist/%s%-26s %s%8.2f kB%s │ gzip: %6.2f kB" % (DIM, R + CYAN, "index.html", B, 0.46, R, 0.30))
+    line("%sdist/assets/%s%-20s %s%8.2f kB%s │ gzip: %6.2f kB" % (DIM, R + MAGENTA, "index-%s.css" % sha(8), B, ri(10, 40) + 0.23, R, ri(3, 9) + 0.11))
+    line("%sdist/assets/%s%-20s %s%8.2f kB%s │ gzip: %6.2f kB" % (DIM, R + YELLOW, "index-%s.js" % sha(8), B, ri(210, 740) + 0.71, R, ri(60, 200) + 0.42))
+    if random.random() < 0.4:
+        line("%s(!) Some chunks are larger than 500 kB after minification. Consider:%s" % (YELLOW, R))
+        line("- Using dynamic import() to code-split the application")
+        line("- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.")
+    line("%s✓ built in %d.%02ds%s" % (GREEN, ri(2, 9), ri(0, 99), R))
+
+
+def sc_jest(fail=None):
+    if fail is None:
+        fail = random.random() < 0.35
+    type_cmd("npm test")
+    line()
+    line("> %s@2.%d.0 test" % (S.proj, ri(1, 20)))
+    line("> jest --coverage=false")
+    line()
+    suites = random.sample(["src/components/Header.test.tsx", "src/hooks/useSession.test.ts",
+                            "src/api/client.test.ts", "src/pages/checkout.test.tsx",
+                            "src/components/OrderTable.test.tsx", "src/utils/format.test.ts",
+                            "src/store/cartSlice.test.ts"], ri(4, 7))
+    bad = random.choice(suites) if fail else None
+    for s in suites:
+        nap(0.2, 0.8)
+        if s == bad:
+            line(" %s%s FAIL %s %s" % (B + sgr(41), "", R, s))
+        else:
+            line(" %s%s PASS %s %s%s" % (B + sgr(42, 30), "", R, s, (" (%d.%02d s)" % (ri(1, 4), ri(0, 99))) if random.random() < 0.4 else ""))
+    if fail:
+        line()
+        line("  %s● cartSlice › applies discount code › rounds to 2 decimals%s" % (RED + B, R))
+        line()
+        line("    expect(received).toBe(expected) // Object.is equality")
+        line()
+        line("    Expected: %s104.35%s" % (GREEN, R))
+        line("    Received: %s104.34%s" % (RED, R))
+        line()
+        line("      %s41 |%s     const total = selectTotal(store.getState());" % (DIM, R))
+        line("    %s> 42 |%s     expect(total).toBe(104.35);" % (RED, R))
+        line("         |                   %s^%s" % (RED, R))
+        line("      %s43 |%s   });" % (DIM, R))
+        line()
+        line("      at Object.<anonymous> (%s:42:19)" % bad)
+    n = ri(60, 190)
+    line()
+    line("%sTest Suites:%s %s%s%d passed%s, %d total" % (B, R, RED + "1 failed, " + R if fail else "", GREEN, len(suites) - (1 if fail else 0), R, len(suites)))
+    line("%sTests:%s       %s%s%d passed%s, %d total" % (B, R, RED + "1 failed, " + R if fail else "", GREEN, n - (1 if fail else 0), R, n))
+    line("%sSnapshots:%s   0 total" % (B, R))
+    line("%sTime:%s        %d.%03d s" % (B, R, ri(2, 9), ri(0, 999)))
+    line("Ran all test suites.")
+    if fail:
+        S.queue.append(lambda: sc_fixup(sc_jest))
+
+
+PIP_PKGS = [("fastapi", "0.110.0"), ("uvicorn", "0.29.0"), ("pydantic", "2.7.1"),
+            ("sqlalchemy", "2.0.29"), ("httpx", "0.27.0"), ("redis", "5.0.4"),
+            ("celery", "5.3.6"), ("structlog", "24.1.0"), ("orjson", "3.10.1"),
+            ("alembic", "1.13.1"), ("boto3", "1.34.90"), ("tenacity", "8.2.3")]
+
+
+def sc_pip():
+    type_cmd("pip install -r requirements.txt")
+    pk = random.sample(PIP_PKGS, ri(4, 7))
+    for name, ver in pk:
+        kb = ri(40, 900)
+        line("Collecting %s==%s" % (name, ver), 0.15)
+        line("  Downloading %s-%s-py3-none-any.whl (%d kB)" % (name, ver, kb), 0.05)
+        steps = ri(4, 9)
+        for i in range(1, steps + 1):
+            f = i / steps
+            out("\r     %s%s%s %.1f/%d.0 kB %.1f MB/s eta 0:00:00\033[K" % (
+                MAGENTA, bar(f, 38, "━", "╺"), R, kb * f, kb, random.uniform(1, 9)))
+            nap(0.03, 0.12)
+        out("\n")
+    spin(lambda: "Installing collected packages: " + ", ".join(n for n, _ in pk), 2)
+    if random.random() < 0.25:
+        line("%sERROR: pip's dependency resolver does not currently take into account all the packages that are installed.%s" % (RED, R))
+        line("celery 5.3.6 requires click<9.0,>=8.1.2, but you have click 8.0.4 which is incompatible.")
+    line("Successfully installed " + " ".join("%s-%s" % p for p in pk))
+
+
+# ----------------------------------------------------------------- tests
+
+PYTEST_FILES = ["tests/test_auth.py", "tests/test_orders.py", "tests/api/test_health.py",
+                "tests/test_ledger.py", "tests/integration/test_stripe_webhook.py",
+                "tests/test_rate_limit.py", "tests/test_serializers.py", "tests/test_billing.py"]
+
+PYTEST_FAILS = [
+    ("test_refresh_token_expiry", ["    def test_refresh_token_expiry(client, freezer):", '        token = client.login("svc-account")', '        freezer.move_to("+3601s")', '        resp = client.get("/v1/session", headers=auth(token))', "        assert resp.status_code == 200"],
+     4, ["assert 401 == 200", " +  where 401 = <Response [401]>.status_code"], "tests/test_auth.py:48", "AssertionError"),
+    ("test_ledger_balance_rounding", ["    def test_ledger_balance_rounding(ledger, account):", "        ledger.post(account, Decimal('33.45'), n=3)", "        assert ledger.balance(account) == Decimal('104.35')"],
+     2, ["AssertionError: assert Decimal('104.34') == Decimal('104.35')"], "tests/test_ledger.py:73", "AssertionError"),
+    ("test_webhook_retries", ["    async def test_webhook_retries(mock_server, worker):", "        await worker.deliver(event)", "        await mock_server.wait_for_calls(3, timeout=5)"],
+     2, ["TimeoutError: timed out waiting for mock server on port 8089"], "tests/integration/test_stripe_webhook.py:112", "TimeoutError"),
+    ("test_idempotent_charge", ["    def test_idempotent_charge(client, card):", "        a = client.post('/v1/charge', json=card, headers=KEY)", "        b = client.post('/v1/charge', json=card, headers=KEY)", "        assert a.json()['id'] == b.json()['id']"],
+     3, ["AssertionError: assert 'ch_3Nq9x' == 'ch_3Nq9y'"], "tests/test_billing.py:96", "AssertionError"),
+    ("test_report_timezone", ["    def test_report_timezone(report):", "        rows = report.generate(tz='America/Los_Angeles')", "        assert rows[0].day == date(2026, 3, 8)"],
+     2, ["AssertionError: assert datetime.date(2026, 3, 9) == datetime.date(2026, 3, 8)"], "tests/test_orders.py:58", "AssertionError"),
+    ("test_rate_limit_burst", ["    def test_rate_limit_burst(client):", "        codes = [client.get('/v1/ping').status_code for _ in range(120)]", "        assert 429 in codes"],
+     2, ["assert 429 in [200, 200, 200, 200, 200, 200, ...]"], "tests/test_rate_limit.py:31", "AssertionError"),
+]
+
+
+def sc_pytest(fail=None):
+    if fail is None:
+        fail = random.random() < 0.4
+    type_cmd("pytest")
+    files = random.sample(PYTEST_FILES, ri(4, len(PYTEST_FILES)))
+    ns = [ri(10, 50) for _ in files]
+    total = sum(ns)
+    rule("test session starts", "")
+    line("platform darwin -- Python 3.12.%d, pytest-8.%d.%d, pluggy-1.%d.0" % (ri(1, 7), ri(0, 3), ri(0, 2), ri(4, 5)))
+    line("rootdir: /Users/%s/work/%s" % (S.user, S.proj))
+    line("configfile: pyproject.toml")
+    line("plugins: cov-5.0.0, asyncio-0.23.6, anyio-4.3.0, mock-3.14.0")
+    line("collected %d items" % total)
+    line()
+    fail_file = random.randrange(len(files)) if fail else -1
+    fail_at = ri(2, ns[fail_file]) if fail else -1
+    done = 0
+    for fi, (f, n) in enumerate(zip(files, ns)):
+        out(f + " ")
+        for i in range(n):
+            if fi == fail_file and i == fail_at - 1:
+                out(RED + "F" + R)
+            elif random.random() < 0.02:
+                out(YELLOW + "s" + R)
+            else:
+                out(GREEN + "." + R)
+            nap(0.01, 0.06)
+        done += n
+        out(" " * max(1, 70 - (len(f) + 1 + n)) + "[%3d%%]\n" % (done * 100 // total))
+    line()
+    secs = random.uniform(3, 14)
+    if fail:
+        name, code, idx, errs, loc, exc = random.choice(PYTEST_FAILS)
+        rule("FAILURES", "")
+        rule(name, RED, "_")
+        line()
+        for i, c in enumerate(code):
+            line((RED + ">" + R + c[1:]) if i == idx else c, 0.01)
+        for e in errs:
+            line("%sE       %s%s" % (RED, e, R), 0.01)
+        line()
+        line("%s%s: %s%s" % (RED, loc, exc, R))
+        rule("short test summary info", "")
+        line("%sFAILED%s %s::%s - %s" % (RED, R, loc.split(":")[0], name, errs[0].split(": ")[-1]))
+        rule("1 failed, %d passed, %d skipped in %.2fs" % (total - 1 - 2, 2, secs), RED)
+        S.queue.append(lambda: sc_fixup(sc_pytest))
+    else:
+        rule("%d passed, %d skipped, %d warnings in %.2fs" % (total - 2, 2, ri(0, 4), secs), GREEN)
+
+
+def sc_cargo(fail=None):
+    if fail is None:
+        fail = random.random() < 0.3
+    type_cmd("cargo build --release")
+    line("%s%12s%s crates.io index" % (GREEN + B, "Updating", R))
+    crates = random.sample([("tokio", "1.37.0"), ("serde", "1.0.198"), ("serde_json", "1.0.116"),
+                            ("hyper", "1.3.1"), ("tower", "0.4.13"), ("tracing", "0.1.40"),
+                            ("reqwest", "0.12.4"), ("axum", "0.7.5"), ("sqlx", "0.7.4"),
+                            ("anyhow", "1.0.82"), ("bytes", "1.6.0"), ("rustls", "0.23.5"),
+                            ("regex", "1.10.4"), ("clap", "4.5.4")], ri(7, 12))
+    line("%s%12s%s %d crates (%d.%d MB) in %d.%02ds" % (GREEN + B, "Downloaded", R, len(crates) + 20, ri(2, 9), ri(1, 9), ri(1, 4), ri(0, 99)))
+    for n, v in crates:
+        line("%s%12s%s %s v%s" % (GREEN + B, "Compiling", R, n, v), 0.12)
+    line("%s%12s%s %s v0.%d.%d (/Users/%s/work/%s)" % (GREEN + B, "Compiling", R, S.proj, ri(1, 9), ri(0, 9), S.user, S.proj), 0.6)
+    if fail:
+        line()
+        line("%serror[E0382]%s%s: borrow of moved value: `config`%s" % (RED + B, R, B, R))
+        line("  %s-->%s src/server.rs:57:22" % (BLUE + B, R))
+        line("   %s|%s" % (BLUE + B, R))
+        line("%s51 |%s     let config = Config::load()?;" % (BLUE + B, R))
+        line("   %s|%s         %s------ move occurs because `config` has type `Config`, which does not implement the `Copy` trait%s" % (BLUE + B, R, BLUE + B, R))
+        line("%s...%s" % (BLUE + B, R))
+        line("%s57 |%s     tracing::info!(port = config.port);" % (BLUE + B, R))
+        line("   %s|%s                    %s^^^^^^^^^^^ value borrowed here after move%s" % (BLUE + B, R, RED + B, R))
+        line()
+        line("%serror%s%s: could not compile `%s` (bin \"%s\") due to 1 previous error%s" % (RED + B, R, B, S.proj, S.proj, R))
+        S.queue.append(lambda: sc_fixup(sc_cargo))
+    else:
+        if random.random() < 0.5:
+            line("%swarning%s%s: unused variable: `ctx`%s" % (YELLOW + B, R, B, R))
+            line("  %s-->%s src/handlers/auth.rs:42:9" % (BLUE + B, R))
+            line("   %s|%s" % (BLUE + B, R))
+            line("%s42 |%s     let ctx = RequestContext::new();" % (BLUE + B, R))
+            line("   %s|%s         %s^^^%s help: if this is intentional, prefix it with an underscore: `_ctx`" % (BLUE + B, R, YELLOW + B, R))
+            line("   %s|%s" % (BLUE + B, R))
+            line("   %s= %snote%s: `#[warn(unused_variables)]` on by default" % (BLUE + B, B, R))
+            line()
+        line("%s%12s%s `release` profile [optimized] target(s) in %d.%02ds" % (GREEN + B, "Finished", R, ri(18, 90), ri(0, 99)))
+
+
+def sc_go():
+    type_cmd("go test ./... -race")
+    pkgs = random.sample(["cmd/server", "internal/ingest", "internal/queue", "internal/metrics",
+                          "internal/store", "internal/config", "pkg/retry", "pkg/batch"], ri(5, 8))
+    base = "github.com/%s/%s" % (S.org, S.proj)
+    for p in sorted(pkgs):
+        nap(0.3, 1.2)
+        if p.startswith("cmd"):
+            line("?   \t%s/%s\t[no test files]" % (base, p))
+        else:
+            c = "(cached)" if random.random() < 0.3 else "%d.%03ds" % (ri(0, 6), ri(0, 999))
+            line("%sok%s  \t%s/%s\t%s" % (GREEN, R, base, p, c))
+
+
+def sc_mypy():
+    type_cmd("mypy app/ --strict")
+    errs = [
+        ('app/api/orders.py:%d: error: Argument 1 to "get_order" has incompatible type "str"; expected "int"  [arg-type]'),
+        ('app/ledger/reconcile.py:%d: error: Incompatible return value type (got "Decimal | None", expected "Decimal")  [return-value]'),
+        ('app/workers/billing.py:%d: error: Missing return statement  [return]'),
+        ('app/settings.py:%d: error: Returning Any from function declared to return "str"  [no-any-return]'),
+        ('app/auth/session.py:%d: error: Item "None" of "Optional[Session]" has no attribute "user_id"  [union-attr]'),
+    ]
+    spin(lambda: "Checking %d files" % ri(40, 120), 2)
+    pick = random.sample(errs, ri(2, 4))
+    for e in pick:
+        path, rest = (e % ri(10, 220)).split(": error: ")
+        line("%s%s%s: %serror:%s %s" % (B, path, R, RED, R, rest))
+    line("Found %d errors in %d files (checked %d source files)" % (len(pick), len(pick), ri(60, 140)))
+
+
+# --------------------------------------------------------------- docker
+
+BASE = {"node": "node:20-alpine", "python": "python:3.12-slim", "rust": "rust:1.78-slim",
+        "go": "golang:1.22-alpine", "infra": "alpine:3.19"}
+RUN = {"node": ["RUN npm ci --omit=dev", "RUN npm run build"],
+       "python": ["RUN pip install --no-cache-dir -r requirements.txt", "RUN python -m compileall app"],
+       "rust": ["RUN cargo fetch", "RUN cargo build --release"],
+       "go": ["RUN go mod download", "RUN CGO_ENABLED=0 go build -o /bin/app ./cmd/server"],
+       "infra": ["RUN apk add --no-cache terraform kubectl", "RUN terraform init -backend=false"]}
+
+
+def sc_docker_build():
+    tag = "%s/%s:%d.%d.%d" % (S.org, S.proj, ri(1, 4), ri(0, 19), ri(0, 9))
+    type_cmd("docker build -t %s ." % tag)
+    base = BASE[S.stack]
+    steps = [("[internal] load build definition from Dockerfile", 0.1), ("=> transferring dockerfile: 1.21kB", 0.0),
+             ("[internal] load metadata for docker.io/library/" + base, 1.2), ("[internal] load .dockerignore", 0.0),
+             ("=> transferring context: 412B", 0.0),
+             ("[1/6] FROM docker.io/library/%s@sha256:%s" % (base, sha(12)), 0.0), ("[internal] load build context", 0.3),
+             ("=> transferring context: %d.%dMB" % (ri(1, 40), ri(1, 9)), 0.3),
+             ("CACHED [2/6] WORKDIR /app", 0.0), ("[3/6] COPY package*.json ./", 0.1)]
+    for i, r in enumerate(RUN[S.stack]):
+        steps.append(("[%d/6] %s" % (4 + i, r), random.uniform(3, 22)))
+    steps.append(("exporting to image", 1.4))
+    steps.append(("=> exporting layers", 1.2))
+    steps.append(("=> writing image sha256:%s" % sha(12), 0.0))
+    steps.append(("=> naming to %s.dkr.ecr.%s.amazonaws.com/%s" % (ACCT, REGION, tag), 0.0))
+    total = sum(s for _, s in steps)
+    w = min(term_w(), 100)
+    line("%s[+] Building %.1fs (%d/%d) FINISHED%s" % (B, total, len(steps) - 4, len(steps) - 4, R + DIM + "  docker:desktop-linux" + R), 0.1)
+    for text, secs in steps:
+        pre = " " + (text if text.startswith("=>") else "=> " + text)
+        pad = max(1, w - len(pre) - 6)
+        col = GREEN if text.startswith("CACHED") else ""
+        line("%s%s%s%s%s%4.1fs" % (col, pre, R, " " * pad, DIM, secs) + R, 0.02)
+        nap(min(secs * 0.12, 1.6))
+    line()
+    line("%sWhat's next:%s" % (B, R))
+    line("    View a summary of image vulnerabilities and recommendations → %sdocker scout quickview%s" % (CYAN, R))
+
+
+def sc_kubectl():
+    ns = random.choice(["production", "staging", "payments"])
+    svc = random.choice(SERVICES)
+    type_cmd("kubectl get pods -n %s" % ns)
+    line("%-44s %-7s %-18s %-9s %s" % ("NAME", "READY", "STATUS", "RESTARTS", "AGE"), 0.03)
+    bad = random.random() < 0.55
+    pods = []
+    for s in random.sample(SERVICES, 5):
+        for _ in range(ri(1, 3)):
+            pods.append("%s-%s-%s" % (s, sha(9)[:9], "".join(random.choices("bcdfghjklmnpqrstvwxz2456789", k=5))))
+    badpod = random.choice(pods) if bad else None
+    for p in pods:
+        if p == badpod:
+            line("%s%-44s %-7s %-18s %-9s %s%s" % (RED, p, "0/1", "CrashLoopBackOff", "%d (2m ago)" % ri(4, 12), "%dm" % ri(8, 60), R), 0.05)
+        else:
+            line("%-44s %-7s %s%-18s%s %-9s %s" % (p, "1/1", GREEN, "Running", R, ri(0, 2), "%dd%dh" % (ri(0, 14), ri(0, 23))), 0.05)
+    if bad:
+        type_cmd("kubectl logs %s -n %s --previous --tail=6" % (badpod, ns))
+        for m in ["INFO  starting %s v1.%d.%d" % (badpod.split("-")[0], ri(2, 9), ri(0, 9)),
+                  "INFO  loading config from /etc/config/app.yaml",
+                  "WARN  feature flag service slow (2104ms)",
+                  random.choice(["ERROR failed to acquire database connection: pq: password authentication failed for user \"svc_app\"",
+                                 "ERROR config key `queue.brokers` is required but not set",
+                                 "ERROR OOMKilled: container exceeded memory limit (512Mi)",
+                                 "ERROR TLS handshake failed: x509: certificate has expired or is not yet valid"]),
+                  "FATAL cannot continue, exiting with code 1"]:
+            line("%s %s" % (now_utc(), m), 0.12)
+        dep = badpod.rsplit("-", 2)[0]
+        type_cmd("kubectl rollout restart deployment/%s -n %s" % (dep, ns))
+        line("deployment.apps/%s restarted" % dep)
+        type_cmd("kubectl rollout status deployment/%s -n %s" % (dep, ns))
+        n = 3
+        for i in range(1, n + 1):
+            nap(0.8, 1.8)
+            line('Waiting for deployment "%s" rollout to finish: %d out of %d new replicas have been updated...' % (dep, i, n))
+        nap(1)
+        line('Waiting for deployment "%s" rollout to finish: 1 old replicas are pending termination...' % dep)
+        nap(1)
+        line('deployment "%s" successfully rolled out' % dep)
+
+
+def sc_logs():
+    svc = random.choice(SERVICES)
+    if random.random() < 0.5:
+        type_cmd("kubectl logs -f deploy/%s -n production --tail=5" % svc)
+    else:
+        type_cmd("tail -f /var/log/%s/%s.log | grep -v healthcheck" % (S.proj, svc))
+    msgs = [
+        ("INFO", "request completed method=GET path=/v2/orders status=200 duration=%dms"),
+        ("INFO", "request completed method=POST path=/v2/sessions status=201 duration=%dms"),
+        ("INFO", "cache hit key=flags:%s ttl=%ds"),
+        ("DEBUG", "pool stats active=%d idle=%d waiting=0"),
+        ("WARN", "connection pool nearing capacity (%d/100)"),
+        ("WARN", "slow query detected duration=%dms table=ledger_entries"),
+        ("ERROR", "upstream timed out after 3000ms service=inventory attempt=%d/5"),
+        ("INFO", "retrying request backoff=%dms"),
+        ("INFO", "batch flushed records=%d"),
+    ]
+    colors = {"INFO": GREEN, "DEBUG": GREY, "WARN": YELLOW, "ERROR": RED}
+    for _ in range(ri(14, 28)):
+        lvl, m = random.choice(msgs)
+        if "%s" in m:
+            m = m % (sha(6), ri(30, 600))
+        elif m.count("%d") == 2:
+            m = m % (ri(1, 20), ri(0, 20))
+        elif "%d" in m:
+            m = m % ri(2, 900)
+        line("%s%s%s %s%-5s%s [%s-%d] %s" % (GREY, now_utc(), R, colors[lvl], lvl, R, svc, ri(1, 12), m), random.choice([0.05, 0.15, 0.4, 0.9]))
+    out("^C\n")
+
+
+def sc_htop():
+    type_cmd("htop")
+    h = term_h()
+    w = min(term_w(), 120)
+    out("\033[?1049h\033[2J")
+    S.alt = True
+    procs = ["node", "python3.12", "postgres", "redis-server", "nginx: worker", "java", "dockerd",
+             "kube-proxy", "containerd", "gunicorn: worker", "vite", "cargo", "rustc", "ruby", "go"]
+    rows = max(6, min(14, h - 12))
+    cores = [random.uniform(5, 80) for _ in range(8)]
+    for _ in range(ri(8, 14)):
+        buf = ["\033[H"]
+        cores = [max(1, min(99, c + random.uniform(-18, 18))) for c in cores]
+        for i in range(0, 8, 2):
+            cells = []
+            for j in (i, i + 1):
+                p = cores[j]
+                n = int(p / 100 * 22)
+                col = GREEN if p < 50 else (YELLOW if p < 80 else RED)
+                cells.append(" %s%d%s [%s%s%s%s%5.1f%%]" % (CYAN, j + 1, R, col, "|" * n, R, " " * (22 - n) + "", p))
+            buf.append("   ".join(cells) + "\033[K\n")
+        mem = random.uniform(7, 14)
+        buf.append("  %sMem%s[%s%s%s%s%5.2fG/16.0G]\033[K\n" % (CYAN, R, GREEN, "|" * int(mem / 16 * 40), R, " " * (40 - int(mem / 16 * 40)), mem))
+        buf.append("  %sSwp%s[%s%s%.2fG/4.00G]\033[K\n" % (CYAN, R, RED, " " * 38 + "", random.uniform(0, 1.5)))
+        buf.append("  Tasks: %s%d%s, %d thr; %s%d%s running   Load average: %.2f %.2f %.2f\033[K\n\033[K\n" % (
+            CYAN, ri(180, 420), R, ri(900, 2400), GREEN, ri(1, 6), R, random.uniform(0.5, 4), random.uniform(0.5, 3), random.uniform(0.5, 2.5)))
+        buf.append(sgr(42, 30) + "  PID USER       PRI  NI  VIRT   RES   SHR S CPU%-MEM%   TIME+  Command".ljust(w) + R + "\n")
+        plist = sorted([(random.uniform(0, 90), random.choice(procs)) for _ in range(rows)], reverse=True)
+        for cpu, name in plist:
+            buf.append("%5d %-10s %3d %3d %5s %5s %5s %s %5.1f %4.1f %3d:%02d.%02d %s\033[K\n" % (
+                ri(300, 99999), S.user[:10], ri(15, 30), 0, "%dM" % ri(80, 4000), "%dM" % ri(20, 900), "%dM" % ri(5, 90),
+                random.choice("SSSR"), cpu, random.uniform(0.1, 9), ri(0, 90), ri(0, 59), ri(0, 99), name))
+        buf.append("\033[%d;1H" % h + sgr(46, 30) + "F1" + R + "Help  " + sgr(46, 30) + "F2" + R + "Setup " + sgr(46, 30) + "F3" + R + "Search" + sgr(46, 30) + "F5" + R + "Tree  " + sgr(46, 30) + "F6" + R + "SortBy" + sgr(46, 30) + "F9" + R + "Kill  " + sgr(46, 30) + "F10" + R + "Quit")
+        out("".join(buf))
+        nap(0.5, 1.1)
+    out("\033[?1049l")
+    S.alt = False
+
+
+def sc_hey():
+    type_cmd("hey -z 30s -c 128 https://%s.staging.%s/v2/health" % (random.choice(SERVICES), S.domain))
+    dur = 3
+    t0 = time.time()
+    while (time.time() - t0) * SPEED < dur:
+        f = (time.time() - t0) * SPEED / dur
+        out("\r[%s%s%s] %2ds/30s  %d reqs\033[K" % (GREEN, bar(f, 30, "=", " "), R, int(f * 30), int(f * 71000)))
+        time.sleep(0.1 / SPEED)
+    out("\r\033[K")
+    tot = random.uniform(30, 30.1)
+    reqs = ri(40000, 90000)
+    line("Summary:")
+    line("  Total:\t%.4f secs" % tot)
+    line("  Slowest:\t%.4f secs" % random.uniform(0.4, 1.9))
+    line("  Fastest:\t0.00%02d secs" % ri(10, 99))
+    line("  Average:\t%.4f secs" % random.uniform(0.02, 0.09))
+    line("  Requests/sec:\t%.4f" % (reqs / tot))
+    line()
+    line("Response time histogram:")
+    shape = [0.01, 1.0, 0.55, 0.22, 0.09, 0.04, 0.02, 0.01, 0.006, 0.002, 0.004]
+    t = 0.0
+    for s in shape:
+        v = int(reqs * 0.4 * s * random.uniform(0.8, 1.2)) + 1
+        line("  %.3f [%d]\t|%s%s%s" % (t, v, BLUE, "■" * int(s * 44), R), 0.04)
+        t += random.uniform(0.04, 0.12)
+    line()
+    line("Status code distribution:")
+    line("  [200]\t%d responses" % (reqs - ri(0, 40)))
+    if random.random() < 0.6:
+        line("  [502]\t%d responses" % ri(1, 40))
+
+
+# ---------------------------------------------------------- misc commands
+
+def sc_curl():
+    svc = random.choice(SERVICES)
+    type_cmd("curl -s https://api.%s/v2/%s/status | jq ." % (S.domain, svc))
+    nap(0.6, 1.5)
+    k, s, n = BLUE + B, GREEN, ORANGE
+    items = [
+        ("status", s + '"ok"'), ("version", s + '"1.%d.%d"' % (ri(4, 9), ri(0, 20))),
+        ("region", s + '"%s"' % REGION), ("uptime_seconds", n + str(ri(10000, 9999999))),
+        ("queue_depth", n + str(ri(0, 4000))), ("p99_latency_ms", n + str(ri(18, 420))),
+        ("healthy", n + random.choice(["true", "true", "false"])),
+    ]
+    line("{")
+    for i, (key, val) in enumerate(items):
+        line('  %s"%s"%s: %s%s%s' % (k, key, R, val, R, "," if i < len(items) - 1 else ""), 0.05)
+    line("}")
+
+
+def sc_grep():
+    type_cmd('grep -rn "TODO\\|FIXME" src/ | head -n 12')
+    for _ in range(ri(5, 12)):
+        f = random.choice(S.files)
+        t = random.choice(["TODO: handle pagination cursor", "FIXME: this leaks a connection on error",
+                           "TODO(%s): remove after migration" % S.user, "FIXME: race with flush timer",
+                           "TODO: move to config", "TODO: add backoff + jitter"])
+        line("%s%s%s:%s%d%s:    // %s%s%s" % (MAGENTA, f, R, GREEN, ri(4, 380), R, "", t, ""), 0.04)
+
+
+def sc_python_crash():
+    ex = random.choice([
+        ("python -m app.worker", "redis.exceptions.ConnectionError: Error 61 connecting to localhost:6379. Connect call failed ('127.0.0.1', 6379).",
+         "docker compose up -d redis", ["[+] Running 2/2", " %s✔%s Network %s_default    Created  0.1s" % (GREEN, R, S.proj),
+                                         " %s✔%s Container %s-redis-1  Started  0.5s" % (GREEN, R, S.proj)]),
+        ("python manage.py migrate", 'psycopg2.OperationalError: connection to server at "localhost" (::1), port 5432 failed: Connection refused',
+         "brew services start postgresql@16", ["==> Successfully started `postgresql@16` (label: homebrew.mxcl.postgresql@16)"]),
+    ])
+    cmd, err, fix, fixout = ex
+    type_cmd(cmd)
+    line("%s INFO  Loading settings from env=development" % now_utc())
+    line("%s INFO  Initializing connection pool size=10" % now_utc())
+    base = "/Users/%s/work/%s" % (S.user, S.proj)
+    line("Traceback (most recent call last):")
+    for fl, ln, fn, code in [(base + "/app/worker.py", 58, "<module>", "main()"),
+                             (base + "/app/worker.py", 41, "main", "broker = connect(settings.DATABASE_URL)"),
+                             (base + "/app/broker.py", 19, "connect", "return pool.acquire()"),
+                             (base + "/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", 1245, "_do_get", "return self._create_connection()")]:
+        line('  File "%s%s%s", line %d, in %s' % (CYAN, fl, R, ln, fn), 0.03)
+        line("    " + code, 0.03)
+    line("%s%s%s" % (RED + B, err, R))
+    nap(0.8, 1.6)
+    type_cmd(fix)
+    for o in fixout:
+        line(o, 0.3)
+    nap(1)
+    type_cmd(cmd)
+    line("%s INFO  Loading settings from env=development" % now_utc())
+    line("%s INFO  Connected, pool size=10" % now_utc())
+    line("%s INFO  Worker ready consumers=8 queues=default,billing" % now_utc())
+    out("^C\n")
+
+
+def sc_terraform(apply=False):
+    type_cmd("terraform plan -out=tfplan" if not apply else "terraform apply")
+    line("Acquiring state lock. This may take a few moments...")
+    for r in random.sample(["aws_vpc.main", "aws_s3_bucket.assets", "aws_eks_cluster.primary", "aws_db_instance.ledger",
+                            "aws_iam_role.worker", "aws_security_group.api", "aws_route53_zone.internal"], ri(4, 6)):
+        line("%s: Refreshing state... [id=%s-%s]" % (r, r.split(".")[0].split("_")[-1], sha(8)), 0.18)
+    line()
+    line("Terraform used the selected providers to generate the following execution plan.")
+    line("Resource actions are indicated with the following symbols:")
+    line("  %s+%s create" % (GREEN, R))
+    line("  %s~%s update in-place" % (YELLOW, R))
+    line()
+    line("Terraform will perform the following actions:")
+    line()
+    line("  %s# aws_instance.worker[0] will be updated in-place%s" % (B, R))
+    line("  %s~%s resource \"aws_instance\" \"worker\" {" % (YELLOW, R))
+    line("        id            = \"i-0%s\"" % sha(15))
+    line("      %s~%s instance_type = \"t3.medium\" %s->%s \"t3.large\"" % (YELLOW, R, B, R))
+    line("        tags          = {}")
+    line("    }")
+    line()
+    line("  %s# aws_s3_bucket.assets will be created%s" % (B, R))
+    line("  %s+%s resource \"aws_s3_bucket\" \"assets\" {" % (GREEN, R))
+    line("      %s+%s bucket = \"%s-assets-%s\"" % (GREEN, R, S.org, sha(5)))
+    line("      %s+%s id     = (known after apply)" % (GREEN, R))
+    line("    }")
+    line()
+    line("%sPlan:%s 1 to add, 1 to change, 0 to destroy." % (B, R))
+    if apply:
+        line()
+        line("Do you want to perform these actions?")
+        line("  Terraform will perform the actions described above.")
+        line("  Only 'yes' will be accepted to approve.")
+        line()
+        ans = ask("  %sEnter a value:%s " % (B, R), "yes")
+        if ans.strip().lower() not in ("yes", "y"):
+            line("%sWarning:%s unrecognized response, assuming approval from the CI policy file." % (YELLOW, R))
+        line()
+        line("aws_s3_bucket.assets: Creating...", 0.6)
+        line("aws_instance.worker[0]: Modifying... [id=i-0%s]" % sha(15), 1.2)
+        line("aws_s3_bucket.assets: Creation complete after 3s [id=%s-assets]" % S.org, 0.4)
+        line("aws_instance.worker[0]: Modifications complete after 41s", 0.4)
+        line()
+        line("%sApply complete! Resources: 1 added, 1 changed, 0 destroyed.%s" % (GREEN + B, R))
+
+
+def sc_ssh(wait=True):
+    ip = "10.%d.%d.%d" % (ri(0, 3), ri(0, 255), ri(2, 250))
+    pub = (ri(34, 54), ri(1, 254), ri(1, 254), ri(1, 254))
+    host = "ec2-%d-%d-%d-%d.%s.compute.amazonaws.com" % (pub + (REGION,))
+    short = "ip-" + ip.replace(".", "-")
+    type_cmd("ssh deploy@%s" % host)
+    nap(0.8, 1.6)
+    if wait:
+        line("The authenticity of host '%s (%s)' can't be established." % (host, "%d.%d.%d.%d" % pub))
+        line("ED25519 key fingerprint is SHA256:%s." % "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+", k=43)))
+        line("This key is not known by any other names.")
+        ask("Are you sure you want to continue connecting (yes/no/[fingerprint])? ", "yes")
+        line("Warning: Permanently added '%s' (ED25519) to the list of known hosts." % host)
+    line("Last login: %s from 10.%d.%d.%d" % (time.strftime("%a %b %d %H:%M:%S %Y"), ri(0, 255), ri(0, 255), ri(2, 250)))
+    pr = "%s@%s:~$ " % ("deploy", short)
+    S.remote = GREEN + B + "deploy@" + short + R + ":" + BLUE + B + "~" + R + "$ "
+    type_cmd("uptime")
+    line(" %s up %d days, %2d:%02d,  1 user,  load average: %.2f, %.2f, %.2f" % (time.strftime("%H:%M:%S"), ri(3, 90), ri(0, 23), ri(0, 59), random.uniform(0.1, 1.5), random.uniform(0.1, 1.5), random.uniform(0.1, 1.5)))
+    type_cmd("df -h /")
+    line("Filesystem      Size  Used Avail Use%% Mounted on")
+    line("/dev/nvme0n1p1   80G   %dG   %dG  %d%% /" % (ri(20, 60), ri(15, 55), ri(30, 75)))
+    svc = random.choice(SERVICES)
+    type_cmd("sudo systemctl status %s --no-pager" % svc)
+    line("%s●%s %s.service - %s service (gunicorn)" % (GREEN, R, svc, svc.capitalize()))
+    line("     Loaded: loaded (/etc/systemd/system/%s.service; enabled; preset: enabled)" % svc)
+    line("     Active: %sactive (running)%s since %s; %d days ago" % (GREEN, R, time.strftime("%a %Y-%m-%d 08:14:02 UTC"), ri(2, 40)))
+    line("   Main PID: %d (gunicorn)" % ri(900, 9000))
+    line("      Tasks: %d (limit: 9443)" % ri(4, 30))
+    line("     Memory: %d.%dM" % (ri(120, 900), ri(0, 9)))
+    line("        CPU: %dh %dmin %d.%03ds" % (ri(0, 9), ri(0, 59), ri(0, 59), ri(0, 999)))
+    type_cmd("exit")
+    S.remote = None
+    line("logout")
+    line("Connection to %s closed." % host)
+
+
+def sc_deploy():
+    env = random.choice(["staging", "staging", "production-canary"])
+    build = sha(7)
+    type_cmd("./scripts/deploy.sh %s" % env)
+    line("%s==>%s Preflight checks" % (BLUE + B, R))
+    for c in ["git working tree clean", "docker daemon reachable",
+              "AWS credentials valid (account %s****%s, %s)" % (ACCT[:4], ACCT[-4:], REGION),
+              "build artifact %s-%s.tar.gz (%d.%d MB)" % (S.proj, build, ri(12, 90), ri(0, 9)),
+              "database migrations: %d pending" % ri(0, 3)]:
+        line("  %s✔%s %s" % (GREEN, R, c), 0.35)
+    ans = ask("%s?%s Deploy build %s%s%s to %s? %s(Y/n)%s " % (CYAN + B, R, B, build, R, env, DIM, R), "y")
+    if ans.strip().lower().startswith("n"):
+        line("%s!%s Interactive approval declined; continuing with --canary 10%% per release policy." % (YELLOW, R))
+    line("%s==>%s Uploading artifact" % (BLUE + B, R))
+    progress("   ", 3)
+    line("%s==>%s Running database migrations" % (BLUE + B, R))
+    for i in range(ri(1, 3)):
+        line("   Applying %04d_%s... %sOK%s" % (ri(100, 400), random.choice(["add_ledger_index", "backfill_currency", "drop_legacy_cols"]), GREEN, R), 0.5)
+    line("%s==>%s Rolling update" % (BLUE + B, R))
+    for i in range(1, 4):
+        nap(0.6, 1.4)
+        line("   instance %d/3 healthy (%s)" % (i, "10.0.%d.%d" % (ri(0, 20), ri(2, 250))))
+    line("%s✔ Deployed%s https://%s.%s in %ds" % (GREEN + B, R, "staging" if env == "staging" else "app", S.domain, ri(60, 140)))
+
+
+def sc_sudo_brew():
+    svc = random.choice(["postgresql@16", "redis", "nginx"])
+    type_cmd("sudo brew services restart %s" % svc)
+    ask("Password:", secret=True, wait=(5.0, 9.0))
+    line()
+    line("Stopping `%s`... (might take a while)" % svc, 0.8)
+    line("%s==>%s Successfully stopped `%s` (label: homebrew.mxcl.%s)" % (GREEN, R, svc, svc))
+    line("%s==>%s Successfully started `%s` (label: homebrew.mxcl.%s)" % (GREEN, R, svc, svc), 0.6)
+
+
+# --------------------------------------------------------------- the editor
+
+SNIPPETS = {
+    "python": [
+        ("app/workers/billing.py", "python", [
+            "async def charge_pending(session, gateway):", "    rows = await session.scalars(select(Invoice).where(Invoice.status == 'pending'))",
+            "    for inv in rows:", "        try:", "            receipt = await gateway.charge(inv.customer_id, inv.amount_cents)",
+            "        except GatewayTimeout:", "            log.warning('gateway timeout', invoice=inv.id)", "            continue",
+            "        inv.status = 'paid'", "        inv.receipt_id = receipt.id", "    await session.commit()"]),
+        ("app/utils/retry.py", "python", [
+            "import functools", "import random", "import time", "", "",
+            "def retry(attempts=5, base=0.2, exceptions=(Exception,)):",
+            "    def wrap(fn):", "        @functools.wraps(fn)", "        def inner(*args, **kwargs):",
+            "            for n in range(attempts):", "                try:",
+            "                    return fn(*args, **kwargs)", "                except exceptions:",
+            "                    if n == attempts - 1:", "                        raise",
+            "                    time.sleep(base * 2 ** n + random.random() * 0.1)",
+            "        return inner", "    return wrap"]),
+        ("app/api/orders.py", "python", [
+            "@router.get('/orders/{order_id}', response_model=OrderOut)",
+            "async def get_order(order_id: int, db: Session = Depends(get_db)):",
+            "    order = await db.get(Order, order_id)", "    if order is None:",
+            "        raise HTTPException(status_code=404, detail='order not found')",
+            "    if order.tenant_id != current_tenant():", "        raise HTTPException(status_code=403)",
+            "    log.info('order fetched', order_id=order_id, status=order.status)", "    return order"]),
+    ],
+    "node": [
+        ("src/store/cartSlice.ts", "ts", [
+            "export const selectTotal = (state: RootState): number => {", "  const subtotal = state.cart.items.reduce(",
+            "    (sum, item) => sum + item.price * item.qty,", "    0,", "  );", "  const discount = state.cart.coupon?.percent ?? 0;",
+            "  return Math.round(subtotal * (1 - discount / 100) * 100) / 100;", "};"]),
+        ("src/components/OrderTable.tsx", "ts", [
+            "export function OrderTable({ orders }: { orders: Order[] }) {", "  const sorted = useMemo(",
+            "    () => [...orders].sort((a, b) => b.createdAt - a.createdAt),", "    [orders],", "  );", "  return (", "    <table className=\"orders\">",
+            "      {sorted.map((o) => <OrderRow key={o.id} order={o} />)}", "    </table>", "  );", "}"]),
+        ("src/hooks/useDebounce.ts", "ts", [
+            "import { useEffect, useState } from 'react';", "",
+            "export function useDebounce<T>(value: T, delay = 250): T {",
+            "  const [debounced, setDebounced] = useState(value);", "",
+            "  useEffect(() => {", "    const id = setTimeout(() => setDebounced(value), delay);",
+            "    return () => clearTimeout(id);", "  }, [value, delay]);", "",
+            "  return debounced;", "}"]),
+        ("src/api/client.ts", "ts", [
+            "export async function request<T>(path: string, init?: RequestInit): Promise<T> {",
+            "  const res = await fetch(`${BASE_URL}${path}`, {",
+            "    ...init,", "    headers: { 'Content-Type': 'application/json', ...init?.headers },",
+            "  });", "  if (!res.ok) {", "    throw new ApiError(res.status, await res.text());", "  }",
+            "  return (await res.json()) as T;", "}"]),
+    ],
+    "rust": [
+        ("src/config.rs", "rust", [
+            "#[derive(Debug, Clone, Deserialize)]", "pub struct Config {", "    pub port: u16,", "    pub database_url: String,",
+            "    pub max_connections: u32,", "}", "", "impl Config {", "    pub fn load() -> anyhow::Result<Self> {",
+            "        let raw = std::fs::read_to_string(\"config.toml\")?;", "        Ok(toml::from_str(&raw)?)", "    }", "}"]),
+        ("src/db/pool.rs", "rust", [
+            "pub async fn connect(cfg: &Config) -> sqlx::Result<PgPool> {", "    PgPoolOptions::new()", "        .max_connections(cfg.max_connections)",
+            "        .acquire_timeout(Duration::from_secs(3))", "        .connect(&cfg.database_url)", "        .await", "}"]),
+        ("src/queue/consumer.rs", "rust", [
+            "pub async fn run(mut rx: mpsc::Receiver<Job>, pool: PgPool) -> anyhow::Result<()> {",
+            "    while let Some(job) = rx.recv().await {", "        let pool = pool.clone();",
+            "        tokio::spawn(async move {", "            if let Err(err) = handle(job, &pool).await {",
+            "                tracing::error!(?err, \"job failed\");", "            }", "        });",
+            "    }", "    Ok(())", "}"]),
+    ],
+    "go": [
+        ("internal/store/pg.go", "go", [
+            "func (s *Store) GetAccount(ctx context.Context, id int64) (*Account, error) {", "\tvar a Account",
+            "\terr := s.db.QueryRowContext(ctx, `SELECT id, name, balance FROM accounts WHERE id = $1`, id).",
+            "\t\tScan(&a.ID, &a.Name, &a.Balance)", "\tif errors.Is(err, sql.ErrNoRows) {", "\t\treturn nil, ErrNotFound", "\t}",
+            "\treturn &a, err", "}"]),
+        ("pkg/retry/retry.go", "go", [
+            "func Do(ctx context.Context, attempts int, fn func() error) error {", "\tvar err error", "\tfor i := 0; i < attempts; i++ {",
+            "\t\tif err = fn(); err == nil {", "\t\t\treturn nil", "\t\t}", "\t\tselect {", "\t\tcase <-time.After(time.Duration(1<<i) * 100 * time.Millisecond):",
+            "\t\tcase <-ctx.Done():", "\t\t\treturn ctx.Err()", "\t\t}", "\t}", "\treturn err", "}"]),
+        ("internal/ingest/batcher.go", "go", [
+            "func (b *Batcher) loop(ctx context.Context) {", "\tticker := time.NewTicker(b.interval)",
+            "\tdefer ticker.Stop()", "\tfor {", "\t\tselect {", "\t\tcase rec := <-b.in:",
+            "\t\t\tb.buf = append(b.buf, rec)", "\t\t\tif len(b.buf) >= b.size {", "\t\t\t\tb.flush(ctx)",
+            "\t\t\t}", "\t\tcase <-ticker.C:", "\t\t\tb.flush(ctx)", "\t\tcase <-ctx.Done():",
+            "\t\t\treturn", "\t\t}", "\t}", "}"]),
+    ],
+    "infra": [
+        ("modules/vpc/main.tf", "hcl", [
+            'resource "aws_vpc" "main" {', "  cidr_block           = var.cidr", "  enable_dns_hostnames = true", "",
+            "  tags = {", '    Name = "${var.env}-vpc"', "  }", "}", "",
+            'resource "aws_subnet" "private" {', "  count      = length(var.azs)", "  vpc_id     = aws_vpc.main.id",
+            "  cidr_block = cidrsubnet(var.cidr, 4, count.index)", "}"]),
+        ("modules/eks/node_groups.tf", "hcl", [
+            'resource "aws_eks_node_group" "workers" {', "  cluster_name    = aws_eks_cluster.primary.name", '  node_group_name = "${var.env}-workers"',
+            "  instance_types  = [var.instance_type]", "", "  scaling_config {", "    desired_size = 3", "    max_size     = 10", "    min_size     = 2", "  }", "}"]),
+        ("modules/rds/main.tf", "hcl", [
+            'resource "aws_db_instance" "ledger" {', '  identifier             = "${var.env}-ledger"',
+            '  engine                 = "postgres"', '  engine_version         = "16.2"',
+            "  instance_class         = var.instance_class", "  allocated_storage      = 100",
+            "  multi_az               = true", "  backup_retention_period = 14",
+            "  vpc_security_group_ids = [aws_security_group.db.id]", "  deletion_protection    = true", "}"]),
+    ],
+}
+
+KEYWORDS = {
+    "python": "def class return import from if else elif for while in not and or with as try except raise yield lambda None True False await async pass",
+    "ts": "const let function return import from export if else for while await async new class interface type extends default throw try catch null undefined true false",
+    "go": "func package import return if else for range go chan defer var const type struct interface select switch case nil true false make",
+    "rust": "fn let mut pub use mod impl struct enum match if else for while return async await Self self Some None Ok Err loop move",
+    "hcl": "resource variable module output data locals provider terraform true false",
+}
+_HL = {}
+
+
+def highlight(text, lang):
+    if lang not in _HL:
+        cm = "#" if lang in ("python", "hcl") else "//"
+        kw = "|".join(KEYWORDS[lang].split())
+        _HL[lang] = re.compile(
+            "(?P<c>" + re.escape(cm) + ".*)"
+            "|(?P<s>\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'|`[^`]*`)"
+            "|(?P<n>\\b\\d+(?:\\.\\d+)?\\b)"
+            "|(?P<k>\\b(?:" + kw + ")\\b)"
+            "|(?P<f>\\b[A-Za-z_]\\w*(?=\\())")
+    col = {"c": GREY, "s": GREEN, "n": ORANGE, "k": MAGENTA, "f": BLUE}
+    return _HL[lang].sub(lambda m: col[m.lastgroup] + m.group() + R, text)
+
+
+def sc_editor():
+    pool = [x for x in SNIPPETS[S.stack] if x[0] != getattr(S, "last_snip", None)] or SNIPPETS[S.stack]
+    name, lang, code = random.choice(pool)
+    S.last_snip = name
+    h = term_h()
+    code = code[:max(6, h - 4)]
+    type_cmd("vim %s" % name)
+    out("\033[?1049h\033[2J\033[H")
+    S.alt = True
+    nap(0.5)
+    out("\033[%d;1H%s -- INSERT --%s%s" % (h, INV, " " * (term_w() - 14), R))
+    out("\033[1;1H")
+    for i, text in enumerate(code, 1):
+        out("%s%3d %s" % (GREY, i, R))
+        type_text(highlight(text, lang), base=0.03)
+        out("\n")
+        nap(0.1, 0.5)
+    nap(0.6, 1.2)
+    out("\033[%d;1H\033[K:" % h)
+    type_text("wq", base=0.2)
+    nap(0.4)
+    out("\033[?1049l")
+    S.alt = False
+    S.dirty = True
+
+
+def sc_fixup(rerun):
+    nap(0.8, 1.6)
+    sc_editor()
+    rerun(fail=False)
+
+
+# ------------------------------------------------------------ flashy stuff
+
+def vlen(s):
+    return len(ANSI.sub("", s))
+
+
+def pad(s, w):
+    return s + " " * max(0, w - vlen(s))
+
+
+def box(title, rows, w, color=BLUE):
+    top = "%s╭─ %s%s%s%s %s╮%s" % (color, R + B, title, R, color, "─" * (w - 5 - len(title)), R)
+    body = ["%s│%s %s %s│%s" % (color, R, pad(r, w - 4), color, R) for r in rows]
+    return [top] + body + ["%s╰%s╯%s" % (color, "─" * (w - 2), R)]
+
+
+def side(a, b, wa, wb):
+    n = max(len(a), len(b))
+    a = a + [" " * wa] * (n - len(a))
+    b = b + [" " * wb] * (n - len(b))
+    return [x + " " + y for x, y in zip(a, b)]
+
+
+def spark(vals, color=CYAN):
+    lo, hi = min(vals), max(vals)
+    return color + "".join("▁▂▃▄▅▆▇█"[int((v - lo) / (hi - lo + 1e-9) * 7)] for v in vals) + R
+
+
+def heat(f):
+    """green -> yellow -> red"""
+    return GREEN if f < 0.5 else (YELLOW if f < 0.8 else RED)
+
+
+def gradient(i, n):
+    stops = [39, 45, 51, 87, 123, 159, 183, 177, 171, 207, 213]
+    return fg(stops[min(len(stops) - 1, i * len(stops) // max(1, n))])
+
+
+def sc_fetch():
+    type_cmd("fastfetch")
+    logo = [
+        "                    'c.", "                 ,xNMM.", "               .OMMMMo",
+        "               OMMM0,", "     .;loddo:' loolloddol;.", "   cKMMMMMMMMMMNWMMMMMMMMMM0:",
+        " .KMMMMMMMMMMMMMMMMMMMMMMMWd.", " XMMMMMMMMMMMMMMMMMMMMMMMX.", ";MMMMMMMMMMMMMMMMMMMMMMMM:",
+        ":MMMMMMMMMMMMMMMMMMMMMMMM:", ".MMMMMMMMMMMMMMMMMMMMMMMMX.", " kMMMMMMMMMMMMMMMMMMMMMMMMWd.",
+        " .XMMMMMMMMMMMMMMMMMMMMMMMMMMk", "  .XMMMMMMMMMMMMMMMMMMMMMMMMK.", "    kMMMMMMMMMMMMMMMMMMMMMMd",
+        "     ;KMMMMMMMWXXWMMMMMMMk.", "       .cooc,.    .,coo:."]
+    cols = [GREEN, GREEN, GREEN, YELLOW, YELLOW, ORANGE, ORANGE, RED, RED, RED, MAGENTA, MAGENTA, MAGENTA, BLUE, BLUE, BLUE, BLUE]
+    mem = ri(9000, 14500)
+    info = [
+        "%s%s@%s%s" % (B + CYAN, S.user, S.host, R), "-" * (len(S.user) + len(S.host) + 1),
+        "%sOS%s: macOS %s arm64" % (B + CYAN, R, platform.mac_ver()[0] or "15.0"),
+        "%sHost%s: MacBook Pro (16-inch, 2023)" % (B + CYAN, R),
+        "%sKernel%s: Darwin %s" % (B + CYAN, R, platform.release()),
+        "%sUptime%s: %d days, %d hours, %d mins" % (B + CYAN, R, ri(0, 12), ri(0, 23), ri(0, 59)),
+        "%sShell%s: zsh 5.9" % (B + CYAN, R), "%sTerminal%s: Terminal.app" % (B + CYAN, R),
+        "%sCPU%s: Apple M2 Pro (12) @ 3.50 GHz" % (B + CYAN, R),
+        "%sMemory%s: %d MiB / 16384 MiB" % (B + CYAN, R, mem),
+        "%sDisk%s: %d GiB / 926 GiB (%d%%)" % (B + CYAN, R, ri(200, 600), ri(25, 65)),
+        "", "".join(sgr(40 + i) + "   " for i in range(8)) + R, "".join(sgr(100 + i) + "   " for i in range(8)) + R,
+    ]
+    off = 2
+    for i, l in enumerate(logo):
+        extra = info[i - off] if 0 <= i - off < len(info) else ""
+        line("%s%s%s   %s" % (cols[i], l.ljust(34), R, extra), 0.04)
+
+
+FONT = {
+    "A": [" ███ ", "█   █", "█████", "█   █", "█   █"], "B": ["████ ", "█   █", "████ ", "█   █", "████ "],
+    "D": ["████ ", "█   █", "█   █", "█   █", "████ "], "E": ["█████", "█    ", "████ ", "█    ", "█████"],
+    "G": [" ████", "█    ", "█  ██", "█   █", " ███ "], "H": ["█   █", "█   █", "█████", "█   █", "█   █"],
+    "I": ["█████", "  █  ", "  █  ", "  █  ", "█████"], "L": ["█    ", "█    ", "█    ", "█    ", "█████"],
+    "N": ["█   █", "██  █", "█ █ █", "█  ██", "█   █"], "O": [" ███ ", "█   █", "█   █", "█   █", " ███ "],
+    "P": ["████ ", "█   █", "████ ", "█    ", "█    "], "R": ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
+    "S": [" ████", "█    ", " ███ ", "    █", "████ "], "U": ["█   █", "█   █", "█   █", "█   █", " ███ "],
+    "Y": ["█   █", " █ █ ", "  █  ", "  █  ", "  █  "], " ": ["   "] * 5,
+}
+
+
+def banner(text):
+    width = sum(len(FONT[c][0]) + 1 for c in text)
+    if width > term_w() - 2:
+        return
+    line()
+    for r in range(5):
+        row = ""
+        x = 0
+        for ch in text:
+            for cell in FONT[ch][r]:
+                row += (gradient(x, width) + cell + R) if cell != " " else " "
+                x += 1
+            row += " "
+            x += 1
+        line("  " + row, 0.07)
+    line()
+
+
+def sc_release():
+    tag = "v%d.%d.%d" % (ri(1, 4), ri(0, 19), ri(0, 9))
+    type_cmd("./scripts/release.sh %s" % tag)
+    for step in ["Running pre-release checks", "Generating changelog (%d commits)" % ri(8, 60),
+                 "Tagging %s" % tag, "Building signed artifacts", "Publishing to registry", "Notifying #releases"]:
+        spin(lambda: step + "...", random.uniform(0.8, 1.8), MAGENTA)
+        line("%s✔%s %s" % (GREEN, R, step), 0.05)
+    banner(random.choice(["DEPLOYED", "BUILD PASSED", "SHIPPED", "ALL GREEN", "RELEASE"]))
+    line("  🚀 %s%s%s is live at https://%s" % (B, tag, R, S.domain))
+
+
+def sc_dashboard():
+    type_cmd("./bin/ops-dash --env production --refresh 1s")
+    h, w = term_h(), min(term_w(), 120)
+    cw = (w - 1) // 2
+    cw2 = w - 1 - cw
+    out("\033[?1049h\033[2J")
+    S.alt = True
+    n = max(10, cw - 6)
+    hist = [ri(400, 900) for _ in range(n)]
+    lat = [random.uniform(18, 40), random.uniform(70, 140), random.uniform(180, 400)]
+    svcs = random.sample(SERVICES, 5)
+    cpu = {s: random.uniform(10, 70) for s in svcs}
+    stages = ["lint", "unit", "build", "push", "migrate", "deploy", "smoke"]
+    prog = 0.0
+    logs = []
+    msgs = ["GET /v2/orders 200 %dms", "POST /v2/sessions 201 %dms", "cache hit flags:%s",
+            "batch flushed records=%d", "WARN slow query %dms ledger_entries", "GET /v2/health 200 %dms"]
+    log_n = max(2, min(8, h - 1 - 6 - 9 - 2 - 1))
+    for _ in range(ri(32, 48)):
+        hist = (hist + [max(150, min(1500, hist[-1] + ri(-140, 150)))])[-n:]
+        for i in range(3):
+            lat[i] = max(5, lat[i] + random.uniform(-8, 8) * (i + 1))
+        for s in svcs:
+            cpu[s] = max(2, min(98, cpu[s] + random.uniform(-9, 9)))
+        prog += 0.03
+        if prog > 1.25:
+            prog = 0.0
+        m = random.choice(msgs)
+        logs.append("%s%s%s %s" % (GREY, now_utc()[11:23], R, (m % sha(5)) if "flags" in m else (m % ri(3, 450))))
+        logs = logs[-log_n:]
+        d = hist[-1] - hist[-2]
+        tp = box("Throughput", ["%s%d%s req/s  %s%s %d%s" % (B, hist[-1], R, GREEN if d >= 0 else RED, "▲" if d >= 0 else "▼", abs(d), R),
+                               spark(hist), "%sp-err %.2f%%   conns %d%s" % (DIM, random.uniform(0.01, 0.4), ri(900, 1200), R),
+                               "%smin %d  max %d  avg %d%s" % (DIM, min(hist), max(hist), sum(hist) // len(hist), R)], cw, CYAN)
+        lt = box("Latency", ["%s %s%s %5.0f ms" % (nm, heat(v / 400), bar(v / 400, 20), v) + R
+                            for nm, v in zip(["p50", "p95", "p99"], lat)] + [""], cw2, MAGENTA)
+        sv = box("Services", ["%s●%s %-10s %s%s%s %3.0f%%  %4dM" % (heat(cpu[s] / 100), R, s, heat(cpu[s] / 100), bar(cpu[s] / 100, 12), R, cpu[s], ri(200, 900)) for s in svcs], cw, GREEN)
+        cur = min(len(stages) - 1, int(prog * len(stages)))
+        pr = []
+        for i, st in enumerate(stages):
+            if prog >= 1.0 or i < cur:
+                pr.append("%s✔%s %s" % (GREEN, R, st))
+            elif i == cur:
+                pr.append("%s%s%s %s%s%s %s" % (CYAN, SPIN[ri(0, 9)], R, B, st, R, CYAN + bar((prog * len(stages)) % 1, 10) + R))
+            else:
+                pr.append("%s○ %s%s" % (GREY, st, R))
+        pl = box("Pipeline", pr, cw2, YELLOW)
+        lg = box("Live log", logs, w, BLUE)
+        head = "%s OPS-DASH %s production  %s  %srefresh 1s%s" % (INV + B, R, time.strftime("%H:%M:%S"), DIM, R)
+        frame = [head] + side(tp, lt, cw, cw2) + side(sv, pl, cw, cw2) + lg
+        out("\033[H" + "".join(l + "\033[K\n" for l in frame[:h - 1]))
+        nap(0.22, 0.4)
+    out("\033[?1049l")
+    S.alt = False
+
+
+def sc_docker_pull():
+    img = random.choice(["postgres:16", "redis:7-alpine", "nginx:1.27", "grafana/grafana:11.0", "node:20-alpine", "prom/prometheus:v2.52"])
+    type_cmd("docker pull %s" % img)
+    line("%s: Pulling from %s" % (img.split(":")[1], img.split(":")[0] if "/" in img else "library/" + img.split(":")[0]))
+    n = ri(5, 8)
+    ids = [sha(12) for _ in range(n)]
+    size = [random.uniform(2, 70) for _ in range(n)]
+    prog = [0.0] * n
+    stage = [0] * n
+    first = True
+    while any(st < 3 for st in stage):
+        active = [i for i in range(n) if 0 < stage[i] < 3]
+        for i in range(n):
+            if stage[i] == 0 and len(active) < 3 and random.random() < 0.5:
+                stage[i] = 1
+                active.append(i)
+        buf = "" if first else "\033[%dA" % n
+        for i in range(n):
+            if stage[i] == 1:
+                prog[i] += random.uniform(0.08, 0.3)
+                if prog[i] >= 1:
+                    prog[i], stage[i] = 0.0, 2
+            elif stage[i] == 2:
+                prog[i] += random.uniform(0.15, 0.4)
+                if prog[i] >= 1:
+                    stage[i] = 3
+            if stage[i] == 0:
+                st = "%sWaiting%s" % (GREY, R)
+            elif stage[i] == 1:
+                k = int(prog[i] * 30)
+                st = "Downloading [%s>%s]  %5.1fMB/%.1fMB" % ("=" * k, " " * (29 - k), prog[i] * size[i], size[i])
+            elif stage[i] == 2:
+                k = int(prog[i] * 30)
+                st = "Extracting [%s>%s]  %.1fMB/%.1fMB" % ("=" * k, " " * (29 - k), prog[i] * size[i], size[i])
+            else:
+                st = "%sPull complete%s" % (GREEN, R)
+            buf += "%s: %s\033[K\n" % (ids[i], st)
+        out(buf)
+        first = False
+        nap(0.07, 0.14)
+    line("Digest: sha256:%s" % sha(64))
+    line("Status: Downloaded newer image for %s" % img)
+    line("docker.io/%s%s" % ("" if "/" in img else "library/", img))
+
+
+def sc_gh_run():
+    type_cmd("gh run watch")
+    jobs = ["lint", "typecheck", "unit (ubuntu-latest, 20)", "unit (macos-latest, 20)", "integration",
+            "build", "docker-publish", "deploy-staging"]
+    dur = [ri(12, 90) for _ in jobs]
+    start = [0, 0, 0, 0, ri(20, 40), ri(40, 70), ri(70, 100), ri(100, 130)]
+    wid = ri(9000000000, 9999999999)
+    line("%s*%s %s CI · %d" % (YELLOW, R, S.branch, wid))
+    line("Triggered via push about 1 minute ago")
+    line()
+    line("%sJOBS%s" % (B, R))
+    t = 0
+    first = True
+    n = len(jobs)
+    while True:
+        buf = "" if first else "\033[%dA" % n
+        done = 0
+        for i, j in enumerate(jobs):
+            if t >= start[i] + dur[i]:
+                buf += "%s✓%s %s in %ds %s(ID %d)%s\033[K\n" % (GREEN, R, j, dur[i], GREY, wid * 10 + i, R)
+                done += 1
+            elif t >= start[i]:
+                buf += "%s%s%s %s %s(ID %d)%s\033[K\n" % (YELLOW, SPIN[(t // 2 + i) % 10], R, j, GREY, wid * 10 + i, R)
+            else:
+                buf += "%s*%s %s\033[K\n" % (GREY, R, j)
+        out(buf)
+        first = False
+        if done == n:
+            break
+        t += 3
+        nap(0.12, 0.2)
+    line()
+    line("%s✓%s Run CI (%d) completed with 'success'" % (GREEN, R, wid))
+
+
+def sc_flame():
+    type_cmd("./bin/profile --pid %d --duration 10s --ascii" % ri(1000, 60000))
+    line("Sampling at 99 Hz... %sdone%s" % (GREEN, R))
+    line("%sSamples: %d   Duration: 10.0s   Threads: %d%s" % (DIM, ri(8000, 12000), ri(4, 16), R))
+    line()
+    names = ["main", "handle_request", "db.query", "serialize_json", "auth.verify", "cache.get", "render_template",
+             "pool.acquire", "http.write", "parse_body", "ledger.reconcile", "batch.flush", "tls.handshake", "gc.collect"]
+    heat_cols = [RED, RED, ORANGE, ORANGE, YELLOW, YELLOW, GREEN]
+    rows = []
+
+    def walk(name, p, depth):
+        rows.append((name, p, depth))
+        if depth < 4 and p > 6:
+            rest = p * random.uniform(0.7, 0.97)
+            for _ in range(ri(1, 3)):
+                share = rest * random.uniform(0.35, 0.8)
+                rest -= share
+                if share > 3:
+                    walk(random.choice(names), share, depth + 1)
+
+    walk("main", 100.0, 0)
+    for name, p, d in rows:
+        cells = p / 100 * 46
+        full = int(cells)
+        part = "▏▎▍▌▋▊▉"[int((cells - full) * 7)] if cells - full > 0.15 else ""
+        line("%s%-26s%s%s%s%s %s%5.1f%%%s" % ("  " * d, name, "", heat_cols[min(d, 6)], "█" * full + part, R, DIM, p, R), 0.04)
+
+
+def sc_cloc():
+    type_cmd("cloc . --exclude-dir=node_modules,dist,target,.venv")
+    langs = {"node": ["TypeScript", "JSON", "CSS", "Markdown", "YAML"], "python": ["Python", "YAML", "SQL", "Markdown", "TOML"],
+             "rust": ["Rust", "TOML", "SQL", "Markdown", "YAML"], "go": ["Go", "YAML", "SQL", "Markdown", "Dockerfile"],
+             "infra": ["HCL", "YAML", "Bourne Shell", "Markdown", "JSON"]}[S.stack]
+    w = 79
+    line("      %d text files." % ri(200, 900))
+    line("      %d unique files." % ri(180, 800))
+    line("github.com/AlDanial/cloc v 1.98  T=%.2f s (%.1f files/s, %.1f lines/s)" % (random.uniform(0.2, 0.9), random.uniform(300, 900), random.uniform(40000, 90000)))
+    line("-" * w)
+    line("%-30s %13s %14s %14s %14s" % ("Language", "files", "blank", "comment", "code"))
+    line("-" * w)
+    tot = [0, 0, 0, 0]
+    for l in langs:
+        f, b, c, code = ri(8, 140), ri(60, 1800), ri(20, 1200), ri(900, 14000)
+        for i, v in enumerate((f, b, c, code)):
+            tot[i] += v
+        line("%-30s %13d %14d %14d %s%14d%s" % (l, f, b, c, GREEN, code, R), 0.05)
+    line("-" * w)
+    line("%-30s %13d %14d %14d %s%14d%s" % ("SUM:", tot[0], tot[1], tot[2], B + GREEN, tot[3], R))
+    line("-" * w)
+
+
+def sc_tree():
+    type_cmd("tree -L 3 -I 'node_modules|target|dist'")
+    tree = {}
+    for f in S.files + ["README.md", ".gitignore", "Dockerfile", "docker-compose.yml"]:
+        node = tree
+        parts = f.split("/")
+        for d in parts[:-1]:
+            node = node.setdefault(d, {})
+        node[parts[-1]] = None
+    counts = [0, 0]
+
+    def walk(node, prefix):
+        items = sorted(node.items(), key=lambda kv: (kv[1] is None, kv[0]))
+        for i, (name, sub) in enumerate(items):
+            last = i == len(items) - 1
+            if sub is None:
+                counts[1] += 1
+                line("%s%s%s" % (prefix, "└── " if last else "├── ", name), 0.03)
+            else:
+                counts[0] += 1
+                line("%s%s%s%s%s" % (prefix, "└── " if last else "├── ", B + BLUE, name, R), 0.03)
+                walk(sub, prefix + ("    " if last else "│   "))
+
+    line(".")
+    walk(tree, "")
+    line()
+    line("%d directories, %d files" % tuple(counts))
+
+
+def sc_ping():
+    host = random.choice(["api.%s" % S.domain, "gateway.%s" % S.domain,
+                          "%s-db.cluster-%s.%s.rds.amazonaws.com" % (S.proj, rid(12), REGION),
+                          "%s-cache.%s.0001.usw2.cache.amazonaws.com" % (S.org.split("-")[0], rid(6))])
+    ip = "10.%d.%d.%d" % (ri(0, 3), ri(0, 255), ri(2, 250))
+    type_cmd("ping -c 6 %s" % host)
+    line("PING %s (%s): 56 data bytes" % (host, ip))
+    ts = []
+    for i in range(6):
+        t = random.uniform(8, 30) + (random.uniform(40, 120) if random.random() < 0.08 else 0)
+        ts.append(t)
+        line("64 bytes from %s: icmp_seq=%d ttl=%d time=%s%.3f ms%s" % (ip, i, ri(52, 60), YELLOW if t > 50 else "", t, R), 0.35)
+    line()
+    line("--- %s ping statistics ---" % host)
+    line("6 packets transmitted, 6 packets received, 0.0%% packet loss")
+    line("round-trip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms" % (min(ts), sum(ts) / 6, max(ts), random.uniform(1, 12)))
+
+
+def sc_secrets():
+    type_cmd("./scripts/rotate-secrets.sh --env staging")
+    line("%s==>%s Decrypting vault bundle (AES-256-GCM)" % (BLUE + B, R))
+    for _ in range(ri(25, 45)):
+        row = " ".join("".join(random.choices("0123456789abcdef", k=8)) for _ in range(ri(4, 7)))
+        out(fg(random.choice([22, 28, 34, 40, 46, 82])) + row + R + "\n")
+        nap(0.015, 0.05)
+    line("%s==>%s Rotating credentials" % (BLUE + B, R))
+    for name in random.sample(["DATABASE_URL", "STRIPE_WEBHOOK_SECRET", "JWT_SIGNING_KEY", "REDIS_PASSWORD", "S3_ACCESS_KEY", "SENTRY_DSN", "SMTP_PASSWORD"], ri(4, 6)):
+        spin(lambda: "rotating %s" % name, random.uniform(0.4, 1.0), MAGENTA)
+        line("  %s✔%s %-24s %sv%d → v%d%s" % (GREEN, R, name, GREY, ri(3, 40), ri(41, 80), R), 0.05)
+    line("%s✔ %d secrets rotated, 0 failures%s" % (GREEN + B, ri(4, 6), R))
+
+
+# ----------------------------------------------------------- more graphics
+
+def _alt_on():
+    out("\033[?1049h\033[2J\033[?25l")
+    S.alt = True
+
+
+def _alt_off():
+    out("\033[?25h\033[?1049l")
+    S.alt = False
+
+
+def sc_traces():
+    type_cmd("./bin/trace show --last --service gateway")
+    total = ri(180, 900)
+    names = [("auth", "verify_token"), ("orders", "list_orders"), ("postgres", "SELECT orders"), ("redis", "GET flags"),
+             ("inventory", "lookup_sku"), ("billing", "price_quote"), ("search", "query_index"), ("gateway", "serialize")]
+    palette = {"gateway": 75, "auth": 177, "orders": 114, "postgres": 215, "redis": 203, "inventory": 80, "billing": 221, "search": 171}
+    spans = [("gateway", "GET /v2/orders", 0, total, 0)]
+
+    def kids(start, dur, depth):
+        if depth > 2 or dur < total * 0.06:
+            return
+        t = start + dur * random.uniform(0.02, 0.1)
+        end = start + dur * 0.95
+        for _ in range(ri(1, 3)):
+            if t >= end - 4:
+                break
+            d = (end - t) * random.uniform(0.25, 0.7)
+            svc, op = random.choice(names)
+            spans.append((svc, op, t, d, depth))
+            kids(t, d, depth + 1)
+            t += d + dur * random.uniform(0.01, 0.05)
+
+    kids(0, total, 1)
+    tw = max(20, min(56, term_w() - 52))
+    line("%sTrace %s   %d spans   %dms   %s%s" % (B, sha(16), len(spans), total, time.strftime("%H:%M:%S"), R))
+    line("%s%-34s %s%s" % (DIM, "service / operation", "0ms" + " " * (tw - 3 - len("%dms" % total)) + "%dms" % total, R))
+    for svc, op, st, d, depth in spans:
+        off = int(st / total * tw)
+        ln = max(1, int(d / total * tw))
+        col = fg(palette[svc])
+        label = ("  " * depth + svc + " " + DIM + op + R)
+        line("%s %s%s%s%s %s%dms%s" % (pad(label, 34), " " * off, col, "█" * ln, R, DIM, d, R), 0.09)
+    line()
+    slow = max(spans[1:], key=lambda x: x[3])
+    line("%sslowest span:%s %s %s (%dms, %d%% of trace)" % (YELLOW, R, slow[0], slow[1], slow[3], slow[3] * 100 // total))
+
+
+def sc_heatmap():
+    type_cmd("git heatmap --since 1y --author \"$(git config user.name)\"")
+    weeks = max(20, min(52, (term_w() - 8) // 2))
+    shades = [236, 22, 28, 34, 46]
+    grid = [[0] * weeks for _ in range(7)]
+    for w in range(weeks):
+        busy = random.random() < 0.8
+        for d in range(7):
+            if busy and (d < 5 or random.random() < 0.15):
+                grid[d][w] = random.choices(range(5), [3, 3, 3, 2, 1])[0]
+    months = "JanFebMarAprMayJunJulAugSepOctNovDec"
+    hdr = [" "] * (weeks * 2)
+    for i in range(0, weeks, 4):
+        m = months[(i // 4 + ri(0, 0)) % 12 * 3:(i // 4) % 12 * 3 + 3]
+        hdr[i * 2:i * 2 + 3] = list(m)
+    line("     " + "".join(hdr), 0.02)
+    first = True
+    for c in range(weeks + 1):
+        if not first:
+            out("\033[7A")
+        first = False
+        for d in range(7):
+            lab = ["", "Mon", "", "Wed", "", "Fri", ""][d]
+            cells = "".join((fg(shades[grid[d][w]]) + "■ " + R) if w < c else (fg(236) + "· " + R) for w in range(weeks))
+            out("  %-3s %s\033[K\n" % (lab, cells))
+        nap(0.03, 0.06)
+    total = sum(sum(r) * ri(2, 5) for r in grid)
+    line()
+    line("  %s%s contributions%s in the last year        Less %s More" % (B, "{:,}".format(total), R, "".join(fg(c) + "■ " + R for c in shades)))
+
+
+def sc_areachart():
+    type_cmd("./bin/metrics --watch cpu,net --window 5m")
+    _alt_on()
+    w = max(30, min(term_w() - 9, 110))
+    h1 = max(5, min(11, (term_h() - 8) * 2 // 3))
+    h2 = max(3, min(6, term_h() - h1 - 8))
+    cpu = [random.uniform(25, 60) for _ in range(w)]
+    net = [random.uniform(20, 70) for _ in range(w)]
+    blocks = " ▁▂▃▄▅▆▇█"
+
+    def chart(vals, h, title, unit, base_col):
+        rows = ["%s%s%s  %s%.0f%s%s" % (B, title, R, (base_col or GREEN) + B, vals[-1], unit, R)]
+        for r in range(h - 1, -1, -1):
+            lab = "%3d%%" % int(100 * (r + 1) / h) if r in (h - 1, h // 2) else "    "
+            cells = ""
+            for v in vals:
+                n = max(0, min(8, int(v / 100 * h * 8) - r * 8))
+                cells += (heat(r / h) if base_col is None else base_col) + blocks[n] + R if n else " "
+            rows.append("%s%s%s │%s" % (GREY, lab, R, cells))
+        rows.append("%s     └%s%s" % (GREY, "─" * w, R))
+        return rows
+
+    for _ in range(ri(45, 70)):
+        cpu = (cpu + [max(3, min(98, cpu[-1] + random.uniform(-9, 9) + (14 if random.random() < 0.03 else 0)))])[-w:]
+        net = (net + [max(3, min(98, net[-1] + random.uniform(-7, 7)))])[-w:]
+        frame = ["%s METRICS %s %s  window 5m  host %s%s" % (INV + B, R, time.strftime("%H:%M:%S"), S.host, R)]
+        frame += chart(cpu, h1, "CPU", "%", None) + chart(net, h2, "Net throughput", " MB/s", CYAN)
+        out("\033[H" + "".join(l + "\033[K\n" for l in frame[:term_h() - 1]))
+        nap(0.1, 0.18)
+    _alt_off()
+
+
+def sc_matrix():
+    type_cmd("./scripts/verify-ledger-integrity.sh --deep")
+    w, h = term_w(), term_h()
+    _alt_on()
+    chars = "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉ0123456789ABCDEF"
+    drops = [random.randint(-h, 0) if random.random() < 0.7 else None for _ in range(w)]
+    speed = [random.choice([1, 1, 2]) for _ in range(w)]
+    trail = [ri(6, h // 2 + 4) for _ in range(w)]
+    frames = ri(55, 80)
+    for f in range(frames):
+        buf = []
+        for x in range(w):
+            y = drops[x]
+            if y is None:
+                if random.random() < 0.03 and f < frames - 25:
+                    drops[x] = 0
+                continue
+            for s in range(speed[x]):
+                yy = y + s
+                if 1 <= yy <= h:
+                    buf.append("\033[%d;%dH\033[97m%s" % (yy, x + 1, random.choice(chars)))
+                if 1 <= yy - 1 <= h:
+                    buf.append("\033[%d;%dH%s%s" % (yy - 1, x + 1, fg(random.choice([46, 40, 34])), random.choice(chars)))
+                if 1 <= yy - trail[x] <= h:
+                    buf.append("\033[%d;%dH " % (yy - trail[x], x + 1))
+            drops[x] = y + speed[x]
+            if drops[x] - trail[x] > h:
+                drops[x] = None
+        out("".join(buf) + R)
+        nap(0.04, 0.06)
+    top = max(1, h // 2 - 2)
+    lft = max(1, (w - 34) // 2)
+    out(R)
+    for i, t in enumerate(["┌" + "─" * 32 + "┐", "│" + "✔ LEDGER INTEGRITY VERIFIED".center(32) + "│",
+                           "│" + ("0 mismatches · %s blocks" % "{:,}".format(ri(4000, 9000))).center(32) + "│",
+                           "└" + "─" * 32 + "┘"]):
+        out("\033[%d;%dH%s%s%s" % (top + i, lft, B + GREEN, t, R))
+    nap(2)
+    _alt_off()
+
+
+def sc_topology():
+    type_cmd("./bin/netwatch --env production --live")
+    _alt_on()
+    tl = max(8, min(16, (term_w() - 50) // 3))
+    lanes = [{"p": [], "n": 0, "ms": ri(8, 40)} for _ in range(3)]
+    names = ["api-1", "api-2", "api-3"]
+    for f in range(ri(60, 90)):
+        frame = [" %s NETWATCH %s production  %s" % (INV + B, R, time.strftime("%H:%M:%S")), ""]
+        for li, ln in enumerate(lanes):
+            if random.random() < 0.35:
+                ln["p"].append([0, 0])
+            tracks = [[None] * tl for _ in range(3)]
+            keep = []
+            for t, pos in ln["p"]:
+                pos += random.choice([1, 1, 2])
+                if pos >= tl:
+                    t, pos = t + 1, 0
+                if t >= 3:
+                    ln["n"] += 1
+                    continue
+                tracks[t][pos] = "●"
+                keep.append([t, pos])
+            ln["p"] = keep
+            cols = [CYAN, YELLOW, GREEN]
+            tr = ["".join((cols[i] + B + c + R) if c else (GREY + "─" + R) for c in tracks[i]) for i in range(3)]
+            node = lambda s, c: sgr(c, 30) + " %s " % s + R
+            frame.append("")
+            frame[-1] = "  %s─%s─%s─%s─%s─%s─%s" % (node("client", 46), tr[0], node("lb", 45), tr[1], node(names[li], 43), tr[2], node("postgres", 42))
+            frame.append("  %s%s req   avg %dms   %s%s" % (GREY, ln["n"] * 17, ln["ms"] + ri(-2, 2), bar(min(1, len(ln["p"]) / 6), 12), R))
+            frame.append("")
+        frame.append("%s  ● request in flight     %d rps     p99 %dms     errors 0.0%d%%%s" % (DIM, ri(900, 1400), ri(80, 190), ri(1, 4), R))
+        out("\033[H" + "".join(l + "\033[K\n" for l in frame[:term_h() - 1]))
+        nap(0.07, 0.11)
+    _alt_off()
+
+
+def sc_ncdu():
+    type_cmd("ncdu .")
+    dirs = {"node": ["node_modules", ".git", "dist", ".next", "coverage", "src", "public"],
+            "python": [".venv", ".git", "data", "htmlcov", "app", "tests", ".mypy_cache"],
+            "rust": ["target", ".git", "src", "benches", "docs", "migrations"],
+            "go": [".git", "vendor", "bin", "internal", "cmd", "pkg"],
+            "infra": [".terraform", ".git", "modules", "envs", "k8s", "docs"]}[S.stack]
+    sizes = sorted([random.uniform(2, 1800) * (1 if d not in (".git", "src", "app", "internal") else 0.2) for d in dirs], reverse=True)
+    line("%s--- /Users/%s/work/%s %s---" % (B, S.user, S.proj, "-" * 30) + R)
+    top = sizes[0]
+    for d, sz in zip(random.sample(dirs, len(dirs)), sizes):
+        n = max(1, int(sz / top * 10))
+        unit = "%6.1f MiB" % sz if sz < 1000 else "%6.2f GiB" % (sz / 1024)
+        line("  %s [%s%s%s%s] /%s" % (unit, ORANGE, "#" * n, GREY, " " * (10 - n) + R, d), 0.12)
+    line(" Total disk usage: %s%.1f GiB%s  Apparent size: %.1f GiB  Items: %s" % (B, sum(sizes) / 1024, R, sum(sizes) / 1024 * 0.93, "{:,}".format(ri(4000, 90000))))
+
+
+# ------------------------------------------------------------------- main
+
+# (function, weight, stacks or None for all)
+SCENARIOS = [
+    (sc_git_pull, 3, None), (sc_git_commit_push, 3, None), (sc_docker_build, 2, None),
+    (sc_logs, 2, None), (sc_htop, 1, None), (sc_hey, 1, None), (sc_curl, 2, None),
+    (sc_grep, 2, None), (sc_editor, 3, None), (sc_kubectl, 2, None),
+    (lambda: sc_ssh(False), 1, None),
+    (sc_dashboard, 3, None), (sc_release, 2, None), (sc_docker_pull, 3, None), (sc_gh_run, 3, None),
+    (sc_traces, 3, None), (sc_heatmap, 2, None), (sc_areachart, 3, None), (sc_matrix, 2, None),
+    (sc_topology, 3, None), (sc_ncdu, 1, None),
+    (sc_flame, 2, None), (sc_cloc, 1, None), (sc_tree, 1, None), (sc_ping, 1, None), (sc_secrets, 3, None),
+    (sc_npm, 3, {"node"}), (sc_vite, 2, {"node"}), (sc_jest, 3, {"node"}),
+    (sc_pip, 3, {"python"}), (sc_pytest, 4, {"python"}), (sc_mypy, 2, {"python"}),
+    (sc_python_crash, 2, {"python"}),
+    (sc_cargo, 4, {"rust"}), (sc_go, 4, {"go"}),
+    (sc_terraform, 4, {"infra"}),
+]
+INTERACTIVE = [
+    (sc_deploy, 3, None), (sc_sudo_brew, 2, None), (sc_merge_conflict, 2, None),
+    (lambda: sc_ssh(True), 2, None), (lambda: sc_terraform(True), 3, {"infra"}),
+]
+
+
+def pick(table):
+    ok = [(f, w) for f, w, st in table
+          if (st is None or S.stack in st) and getattr(f, "__name__", "") + str(id(f)) not in S.recent]
+    fns, ws = zip(*ok)
+    f = random.choices(fns, ws)[0]
+    S.recent = (S.recent + [getattr(f, "__name__", "") + str(id(f))])[-8:]
+    return f
+
+
+def main():
+    global SPEED
+    ap = argparse.ArgumentParser(description="Look busy. Everything is fake and harmless.")
+    ap.add_argument("--speed", type=float, default=1.0, help="2 = twice as fast, 0.5 = slower")
+    ap.add_argument("--seed", type=int, help="repeatable randomness")
+    args = ap.parse_args()
+    SPEED = max(0.05, args.speed)
+    if args.seed is not None:
+        random.seed(args.seed)
+
+    if S.tty and termios:
+        S.saved_tty = termios.tcgetattr(0)
+    atexit.register(cleanup)
+    set_echo(False)
+    out("\033[2J\033[H")
+    S.proj, S.branch = "~", "main"
+    S.dirty = False
+    sc_fetch()
+    switch_project(first=True)
+    count = 0
+    until_ask = ri(3, 5)
+    try:
+        while True:
+            nap(0.3, 1.1)
+            if S.queue:
+                S.queue.pop(0)()
+            elif until_ask <= 0:
+                pick(INTERACTIVE)()
+                until_ask = ri(3, 6)
+            elif count and count % ri(7, 11) == 0:
+                switch_project()
+            else:
+                pick(SCENARIOS)()
+            count += 1
+            until_ask -= 1
+    except KeyboardInterrupt:
+        out("\n")
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
