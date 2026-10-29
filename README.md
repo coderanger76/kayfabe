@@ -11,6 +11,8 @@ and logs, none of it real.
 | ![release](screenshots/release.png) | ![metrics](screenshots/areachart.png) |
 | ![subnet map](screenshots/subnet.png) | ![goaccess](screenshots/goaccess.png) |
 | ![powershell](screenshots/ps.png) | ![ansible](screenshots/ansible.png) |
+| ![tmux](screenshots/tmux.png) | ![nvidia-smi](screenshots/nvidia.png) |
+| ![trivy](screenshots/trivy.png) | |
 
 ## Run it
 

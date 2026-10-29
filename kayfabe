@@ -3557,7 +3557,7 @@ def sc_tmux():
     cpu = [random.uniform(10, 70) for _ in range(4)]
     pods = ["%s-%s" % (s, sha(5)) for s in random.sample(SERVICES, min(len(SERVICES), max(2, bh - 2)))]
     age = [ri(1, 600) for _ in pods]
-    for f in range(ri(40, 70)):
+    for f in range(ri(70, 100)):
         w2, h2 = term_w(), term_h()
         if (w2, h2) != (w, h):  # window resized mid-scene: recompute the layout
             w, h = w2, h2
@@ -3567,9 +3567,9 @@ def sc_tmux():
             bh = h - 1 - th - 1
             out("\033[2J")
         buf = []
-        if f % 2 == 0:
+        if True:
             lvl = random.choices(["INFO", "WARN", "ERROR"], [8, 2, 1])[0]
-            logs.append((lvl, "%s %-5s %s-%d request completed status=%d duration=%dms" % (time.strftime("%H:%M:%S"), lvl, svc, ri(1, 9), random.choice([200, 200, 200, 201, 404, 500]), ri(3, 900))))
+            logs.append((lvl, "%s %-5s %s-%d %s %s %d %dms" % (time.strftime("%H:%M:%S"), lvl, svc, ri(1, 9), random.choice(["GET", "GET", "POST"]), random.choice(["/v2/orders", "/v2/sessions", "/healthz", "/v2/accounts"]), random.choice([200, 200, 200, 201, 404, 500]), ri(3, 900))))
             logs = logs[-(h - 2):]
         col = {"INFO": "", "WARN": YELLOW, "ERROR": RED}
         for r in range(h - 1):
