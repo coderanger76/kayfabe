@@ -9,6 +9,8 @@ and logs, none of it real.
 | | |
 |---|---|
 | ![release](screenshots/release.png) | ![metrics](screenshots/areachart.png) |
+| ![subnet map](screenshots/subnet.png) | ![goaccess](screenshots/goaccess.png) |
+| ![powershell](screenshots/ps.png) | ![ansible](screenshots/ansible.png) |
 
 ## Run it
 
@@ -21,12 +23,13 @@ One Python file, standard library only, Python 3.8+. Copy it to any Mac and run 
 
 ## What you'll see
 
-Git pulls and pushes, npm/pip/cargo/go builds, pytest and jest runs (with
-failures that get fixed in vim and re-run), docker builds and pulls, kubectl,
-terraform, ssh sessions, flame graphs, request traces, a live ops dashboard,
-area charts, a network traffic view, matrix rain, and a gradient banner when a
-"release" ships. Everything is randomized, and the mix changes with the
-project it is pretending to work on.
+About 50 scenarios per project type, picked at random and never repeated back to back.
+
+- **Dev work:** git pull/push/merge conflicts, npm, pip, cargo and go builds, pytest and jest runs (failures get fixed in vim, then re-run), docker builds and pulls, kubectl, terraform, CI runs, releases with a gradient banner.
+- **IT admin:** PowerShell remoting into a domain controller (`Get-ADUser`, lockouts, `ipconfig /all`, `pathping`, `repadmin`, `dcdiag`), `dig` in eight flavors including `+trace` and DNSSEC, `nmap` scans, `tcpdump`, `openssl s_client`, `mtr`, Ansible playbooks, backups, `brew upgrade`.
+- **Graphics:** a live ops dashboard, scrolling area charts, network traffic lanes, a subnet latency map, certificate expiry bars, a GoAccess-style panel, request traces, flame graphs, a commit heatmap, matrix rain.
+
+Everything is randomized: hostnames, hashes, timings, names, commit messages, and the pacing itself, which swings between bursts and lulls.
 
 Every few commands it stops at a prompt (deploy? password? host key?). If you
 type something it accepts it; if you don't, it waits a few seconds and answers

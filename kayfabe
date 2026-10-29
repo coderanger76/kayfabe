@@ -99,9 +99,10 @@ def line(s="", d=0.02):
     nap(d * 0.6, d * 1.6)
 
 
-def bar(frac, w=30, full="█", empty="░"):
+def bar(frac, w=30, full="━", empty="─"):
+    """Thin bars (not full-height blocks) so stacked rows don't fuse together."""
     n = int(max(0.0, min(1.0, frac)) * w)
-    return full * n + empty * (w - n)
+    return full * n + GREY + empty * (w - n) + R
 
 
 def rule(text, color, ch="="):
@@ -264,9 +265,14 @@ PROJECTS = [
     ("orion-core", "rust", "acme-labs"),
     ("beacon-ingest", "go", "vantage-io"),
     ("infra-live", "infra", "northwind"),
+    ("netops-toolkit", "it", "northwind"),
+    ("corp-it-scripts", "it", "helix-systems"),
+    ("ansible-fleet", "it", "brightpath"),
 ]
 
 FILES = {
+    "it": ["scripts/Get-StaleAccounts.ps1", "scripts/Reset-UserPassword.ps1", "dns/zones/corp.zone", "dhcp/scopes.json",
+           "firewall/rules.yaml", "ansible/site.yml", "ansible/roles/nginx/tasks/main.yml", "docs/runbook.md"],
     "node": ["src/components/Header.tsx", "src/hooks/useSession.ts", "src/api/client.ts",
              "src/pages/checkout.tsx", "src/store/cartSlice.ts", "vite.config.ts",
              "src/components/OrderTable.tsx", "package.json"],
@@ -708,9 +714,9 @@ def sc_mypy():
 
 # --------------------------------------------------------------- docker
 
-BASE = {"node": "node:20-alpine", "python": "python:3.12-slim", "rust": "rust:1.78-slim",
+BASE = {"it": "alpine:3.19", "node": "node:20-alpine", "python": "python:3.12-slim", "rust": "rust:1.78-slim",
         "go": "golang:1.22-alpine", "infra": "alpine:3.19"}
-RUN = {"node": ["RUN npm ci --omit=dev", "RUN npm run build"],
+RUN = {"it": ["RUN apk add --no-cache ansible bind-tools nmap", "RUN pip install --no-cache-dir pywinrm"], "node": ["RUN npm ci --omit=dev", "RUN npm run build"],
        "python": ["RUN pip install --no-cache-dir -r requirements.txt", "RUN python -m compileall app"],
        "rust": ["RUN cargo fetch", "RUN cargo build --release"],
        "go": ["RUN go mod download", "RUN CGO_ENABLED=0 go build -o /bin/app ./cmd/server"],
@@ -1016,7 +1022,7 @@ def sc_ssh(wait=True):
     type_cmd("uptime")
     line(" %s up %d days, %2d:%02d,  1 user,  load average: %.2f, %.2f, %.2f" % (time.strftime("%H:%M:%S"), ri(3, 90), ri(0, 23), ri(0, 59), random.uniform(0.1, 1.5), random.uniform(0.1, 1.5), random.uniform(0.1, 1.5)))
     type_cmd("df -h /")
-    line("Filesystem      Size  Used Avail Use%% Mounted on")
+    line("Filesystem      Size  Used Avail Use% Mounted on")
     line("/dev/nvme0n1p1   80G   %dG   %dG  %d%% /" % (ri(20, 60), ri(15, 55), ri(30, 75)))
     svc = random.choice(SERVICES)
     type_cmd("sudo systemctl status %s --no-pager" % svc)
@@ -1071,6 +1077,17 @@ def sc_sudo_brew():
 # --------------------------------------------------------------- the editor
 
 SNIPPETS = {
+    "it": [
+        ("scripts/Get-StaleAccounts.ps1", "ps", [
+            "function Get-StaleAccounts {", "    param([int]$Days = 90)", "    $cutoff = (Get-Date).AddDays(-$Days)",
+            "    Get-ADUser -Filter 'Enabled -eq $true' -Properties LastLogonDate |",
+            "        Where-Object { $_.LastLogonDate -lt $cutoff } |", "        Select-Object Name, SamAccountName, LastLogonDate |",
+            "        Sort-Object LastLogonDate", "}"]),
+        ("scripts/Reset-UserPassword.ps1", "ps", [
+            "param([Parameter(Mandatory)][string]$Identity)", "", "try {", "    $pw = ConvertTo-SecureString (New-Guid).Guid -AsPlainText -Force",
+            "    Set-ADAccountPassword -Identity $Identity -NewPassword $pw -Reset", "    Set-ADUser -Identity $Identity -ChangePasswordAtLogon $true",
+            "    Write-Host \"Password reset for $Identity\"", "} catch {", "    Write-Error $_.Exception.Message", "}"]),
+    ],
     "python": [
         ("app/workers/billing.py", "python", [
             "async def charge_pending(session, gateway):", "    rows = await session.scalars(select(Invoice).where(Invoice.status == 'pending'))",
@@ -1172,6 +1189,7 @@ KEYWORDS = {
     "ts": "const let function return import from export if else for while await async new class interface type extends default throw try catch null undefined true false",
     "go": "func package import return if else for range go chan defer var const type struct interface select switch case nil true false make",
     "rust": "fn let mut pub use mod impl struct enum match if else for while return async await Self self Some None Ok Err loop move",
+    "ps": "function param foreach if else elseif return try catch finally switch while begin process end",
     "hcl": "resource variable module output data locals provider terraform true false",
 }
 _HL = {}
@@ -1179,15 +1197,16 @@ _HL = {}
 
 def highlight(text, lang):
     if lang not in _HL:
-        cm = "#" if lang in ("python", "hcl") else "//"
+        cm = "#" if lang in ("python", "hcl", "ps") else "//"
         kw = "|".join(KEYWORDS[lang].split())
         _HL[lang] = re.compile(
             "(?P<c>" + re.escape(cm) + ".*)"
             "|(?P<s>\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'|`[^`]*`)"
+            "|(?P<v>\\$[A-Za-z_]\\w*)"
             "|(?P<n>\\b\\d+(?:\\.\\d+)?\\b)"
             "|(?P<k>\\b(?:" + kw + ")\\b)"
             "|(?P<f>\\b[A-Za-z_]\\w*(?=\\())")
-    col = {"c": GREY, "s": GREEN, "n": ORANGE, "k": MAGENTA, "f": BLUE}
+    col = {"c": GREY, "s": GREEN, "n": ORANGE, "k": MAGENTA, "f": BLUE, "v": CYAN}
     return _HL[lang].sub(lambda m: col[m.lastgroup] + m.group() + R, text)
 
 
@@ -1491,15 +1510,15 @@ def sc_flame():
     for name, p, d in rows:
         cells = p / 100 * 46
         full = int(cells)
-        part = "▏▎▍▌▋▊▉"[int((cells - full) * 7)] if cells - full > 0.15 else ""
-        line("%s%-26s%s%s%s%s %s%5.1f%%%s" % ("  " * d, name, "", heat_cols[min(d, 6)], "█" * full + part, R, DIM, p, R), 0.04)
+        line("%s%-26s%s%s%s%s %s%5.1f%%%s" % ("  " * d, name, "", heat_cols[min(d, 6)], "▄" * max(1, full), R, DIM, p, R), 0.04)
 
 
 def sc_cloc():
     type_cmd("cloc . --exclude-dir=node_modules,dist,target,.venv")
     langs = {"node": ["TypeScript", "JSON", "CSS", "Markdown", "YAML"], "python": ["Python", "YAML", "SQL", "Markdown", "TOML"],
              "rust": ["Rust", "TOML", "SQL", "Markdown", "YAML"], "go": ["Go", "YAML", "SQL", "Markdown", "Dockerfile"],
-             "infra": ["HCL", "YAML", "Bourne Shell", "Markdown", "JSON"]}[S.stack]
+             "infra": ["HCL", "YAML", "Bourne Shell", "Markdown", "JSON"],
+             "it": ["PowerShell", "YAML", "Bourne Shell", "JSON", "Markdown"]}[S.stack]
     w = 79
     line("      %d text files." % ri(200, 900))
     line("      %d unique files." % ri(180, 800))
@@ -1561,7 +1580,7 @@ def sc_ping():
         line("64 bytes from %s: icmp_seq=%d ttl=%d time=%s%.3f ms%s" % (ip, i, ri(52, 60), YELLOW if t > 50 else "", t, R), 0.35)
     line()
     line("--- %s ping statistics ---" % host)
-    line("6 packets transmitted, 6 packets received, 0.0%% packet loss")
+    line("6 packets transmitted, 6 packets received, 0.0% packet loss")
     line("round-trip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms" % (min(ts), sum(ts) / 6, max(ts), random.uniform(1, 12)))
 
 
@@ -1622,7 +1641,7 @@ def sc_traces():
         ln = max(1, int(d / total * tw))
         col = fg(palette[svc])
         label = ("  " * depth + svc + " " + DIM + op + R)
-        line("%s %s%s%s%s %s%dms%s" % (pad(label, 34), " " * off, col, "█" * ln, R, DIM, d, R), 0.09)
+        line("%s %s%s%s%s %s%dms%s" % (pad(label, 34), " " * off, col, "▄" * ln, R, DIM, d, R), 0.09)
     line()
     slow = max(spans[1:], key=lambda x: x[3])
     line("%sslowest span:%s %s %s (%dms, %d%% of trace)" % (YELLOW, R, slow[0], slow[1], slow[3], slow[3] * 100 // total))
@@ -1774,7 +1793,8 @@ def sc_ncdu():
             "python": [".venv", ".git", "data", "htmlcov", "app", "tests", ".mypy_cache"],
             "rust": ["target", ".git", "src", "benches", "docs", "migrations"],
             "go": [".git", "vendor", "bin", "internal", "cmd", "pkg"],
-            "infra": [".terraform", ".git", "modules", "envs", "k8s", "docs"]}[S.stack]
+            "infra": [".terraform", ".git", "modules", "envs", "k8s", "docs"],
+            "it": [".git", "scripts", "ansible", "dns", "dhcp", "docs"]}[S.stack]
     sizes = sorted([random.uniform(2, 1800) * (1 if d not in (".git", "src", "app", "internal") else 0.2) for d in dirs], reverse=True)
     line("%s--- /Users/%s/work/%s %s---" % (B, S.user, S.proj, "-" * 30) + R)
     top = sizes[0]
@@ -1783,6 +1803,925 @@ def sc_ncdu():
         unit = "%6.1f MiB" % sz if sz < 1000 else "%6.2f GiB" % (sz / 1024)
         line("  %s [%s%s%s%s] /%s" % (unit, ORANGE, "#" * n, GREY, " " * (10 - n) + R, d), 0.12)
     line(" Total disk usage: %s%.1f GiB%s  Apparent size: %.1f GiB  Items: %s" % (B, sum(sizes) / 1024, R, sum(sizes) / 1024 * 0.93, "{:,}".format(ri(4000, 90000))))
+
+
+# ------------------------------------------------------------ IT / sysadmin
+
+FIRST = ["Maria", "James", "Priya", "Chen", "Olivia", "Marcus", "Sofia", "Kenji", "Amara", "Daniel", "Hannah",
+         "Luis", "Aisha", "Tom", "Elena", "Rafael", "Grace", "Viktor", "Nadia", "Owen", "Leila", "Henrik"]
+LAST = ["Alvarez", "Nguyen", "Patel", "Okafor", "Sullivan", "Kim", "Rossi", "Haddad", "Lindgren", "Brooks",
+        "Tanaka", "Moreau", "Fischer", "Delgado", "Bianchi", "Osei", "Kowalski", "Reyes", "Hughes", "Varga"]
+NET = ri(0, 30)
+
+
+def person():
+    f, l = random.choice(FIRST), random.choice(LAST)
+    return f, l, (f[0] + l).lower()
+
+
+def ad_domain():
+    return "corp." + S.domain
+
+
+def dn_base():
+    return ",".join("DC=" + p for p in ad_domain().split("."))
+
+
+def sid():
+    return "S-1-5-21-%d-%d-%d-%d" % (ri(10 ** 9, 4 * 10 ** 9), ri(10 ** 9, 4 * 10 ** 9), ri(10 ** 9, 4 * 10 ** 9), ri(1000, 9999))
+
+
+def pip4(sub=None):
+    return "10.%d.%d.%d" % (NET, ri(0, 9) if sub is None else sub, ri(2, 250))
+
+
+def wmac():
+    return "00-50-56-%02X-%02X-%02X" % (ri(0, 255), ri(0, 255), ri(0, 255))
+
+
+def when(days_ago=0):
+    return time.strftime("%m/%d/%Y %I:%M:%S %p", time.localtime(time.time() - days_ago * 86400 - ri(0, 80000)))
+
+
+def ps_table(heads, rows, d=0.04):
+    w = [max([len(h)] + [len(r[i]) for r in rows]) for i, h in enumerate(heads)]
+    line()
+    line(GREEN + B + " ".join(h.ljust(w[i]) for i, h in enumerate(heads)) + R, 0.02)
+    line(GREEN + B + " ".join("-" * len(h) + " " * (w[i] - len(h)) for i, h in enumerate(heads)) + R, 0.02)
+    for r in rows:
+        line(" ".join(c.ljust(w[i]) for i, c in enumerate(r)), d)
+    line()
+
+
+def ps_list(pairs, label_w=None):
+    label_w = label_w or max(len(k) for k, _ in pairs)
+    for k, v in pairs:
+        line("%s : %s" % (k.ljust(label_w), v), 0.03)
+
+
+def _people(n):
+    return [person() for _ in range(n)]
+
+
+def c_aduser_filter():
+    ou = random.choice(["Finance", "Engineering", "Sales", "Operations", "Support"])
+    type_cmd("Get-ADUser -Filter 'Enabled -eq $true' -SearchBase \"OU=%s,OU=HQ,%s\" | Select-Object Name,SamAccountName,Enabled" % (ou, dn_base()))
+    nap(0.5, 1.2)
+    ps_table(["Name", "SamAccountName", "Enabled"], [["%s %s" % (f, l), s, "True"] for f, l, s in _people(ri(4, 8))])
+
+
+def c_aduser_identity():
+    f, l, s = person()
+    type_cmd("Get-ADUser -Identity %s -Properties *" % s)
+    nap(0.6, 1.4)
+    pairs = [("DistinguishedName", "CN=%s %s,OU=Users,OU=HQ,%s" % (f, l, dn_base())), ("Enabled", "True"),
+             ("GivenName", f), ("LastLogonDate", when(ri(0, 3))), ("LockedOut", "False"),
+             ("mail", "%s@%s" % (s, S.domain)), ("MemberOf", "{CN=VPN-Users,OU=Groups,%s, CN=Staff,OU=Groups,%s}" % (dn_base(), dn_base())),
+             ("PasswordLastSet", when(ri(5, 80))), ("PasswordNeverExpires", "False"),
+             ("SamAccountName", s), ("SID", sid()), ("Surname", l), ("UserPrincipalName", "%s@%s" % (s, ad_domain()))]
+    line()
+    ps_list(pairs, 20)
+    line()
+
+
+def c_locked():
+    people = _people(ri(1, 3))
+    type_cmd("Search-ADAccount -LockedOut | Select-Object Name,SamAccountName,LockedOut,LastLogonDate")
+    nap(0.6, 1.2)
+    ps_table(["Name", "SamAccountName", "LockedOut", "LastLogonDate"], [["%s %s" % (f, l), s, "True", when(0)] for f, l, s in people])
+    s = people[0][2]
+    type_cmd("Unlock-ADAccount -Identity %s" % s)
+    nap(0.5, 1)
+    type_cmd("Get-ADUser %s -Properties LockedOut | Select-Object SamAccountName,LockedOut" % s)
+    ps_table(["SamAccountName", "LockedOut"], [[s, "False"]])
+
+
+def c_group():
+    g = random.choice(["Domain Admins", "VPN-Users", "Finance-RW", "Server Operators", "Helpdesk"])
+    type_cmd("Get-ADGroupMember -Identity \"%s\" | Select-Object name,objectClass" % g)
+    nap(0.5, 1.1)
+    ps_table(["name", "objectClass"], [["%s %s" % (f, l), "user"] for f, l, _ in _people(ri(3, 6))] + [["svc-backup", "user"]])
+
+
+def c_computers():
+    type_cmd("Get-ADComputer -Filter * -Properties OperatingSystem | Group-Object OperatingSystem | Sort-Object Count -Descending | Select-Object Count,Name")
+    nap(0.8, 1.6)
+    ps_table(["Count", "Name"], [[str(ri(40, 400)), "Windows 11 Enterprise"], [str(ri(10, 200)), "Windows 10 Enterprise"],
+                                 [str(ri(8, 40)), "Windows Server 2022 Standard"], [str(ri(2, 14)), "Windows Server 2019 Datacenter"]])
+
+
+def c_services():
+    type_cmd("Get-Service | Where-Object {$_.Status -eq 'Running'} | Select-Object -First 8")
+    nap(0.5, 1)
+    svcs = [("Dnscache", "DNS Client"), ("NTDS", "Active Directory Domain Services"), ("Netlogon", "Netlogon"), ("W32Time", "Windows Time"),
+            ("DFSR", "DFS Replication"), ("Kdc", "Kerberos Key Distribution Center"), ("LanmanServer", "Server"), ("EventLog", "Windows Event Log"),
+            ("DNS", "DNS Server"), ("WinRM", "Windows Remote Management (WS-Management)"), ("Spooler", "Print Spooler")]
+    ps_table(["Status", "Name", "DisplayName"], [["Running", n, d] for n, d in random.sample(svcs, 8)])
+
+
+def c_eventlog():
+    type_cmd("Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4624,4625,4740} -MaxEvents 6 | Format-Table TimeCreated,Id,Message -AutoSize")
+    nap(0.8, 1.6)
+    ev = [("4624", "An account was successfully logged on."), ("4625", "An account failed to log on."),
+          ("4740", "A user account was locked out."), ("4624", "An account was successfully logged on.")]
+    ps_table(["TimeCreated", "Id", "Message"], [[when(0), *random.choice(ev)] for _ in range(6)])
+
+
+def c_ipconfig():
+    host = S.dc.upper()
+    ip = pip4(4)
+    gw = ".".join(ip.split(".")[:3]) + ".1"
+    type_cmd("ipconfig /all")
+    line()
+    line("Windows IP Configuration")
+    line()
+    for k, v in [("Host Name . . . . . . . . . . . . ", host), ("Primary Dns Suffix  . . . . . . . ", ad_domain()),
+                 ("Node Type . . . . . . . . . . . . ", "Hybrid"), ("IP Routing Enabled. . . . . . . . ", "No"),
+                 ("WINS Proxy Enabled. . . . . . . . ", "No"), ("DNS Suffix Search List. . . . . . ", ad_domain())]:
+        line("   %s: %s" % (k, v), 0.03)
+    line()
+    line("Ethernet adapter Ethernet0:")
+    line()
+    for k, v in [("Connection-specific DNS Suffix  . ", ""), ("Description . . . . . . . . . . . ", "Microsoft Hyper-V Network Adapter"),
+                 ("Physical Address. . . . . . . . . ", wmac()), ("DHCP Enabled. . . . . . . . . . . ", "No"),
+                 ("Autoconfiguration Enabled . . . . ", "Yes"), ("IPv4 Address. . . . . . . . . . . ", ip + "(Preferred)"),
+                 ("Subnet Mask . . . . . . . . . . . ", "255.255.255.0"), ("Default Gateway . . . . . . . . . ", gw),
+                 ("DNS Servers . . . . . . . . . . . ", ip), ("", "%s" % pip4(4)), ("NetBIOS over Tcpip. . . . . . . . ", "Enabled")]:
+        line(("   %s: %s" % (k, v)) if k else ("   " + " " * 36 + v), 0.03)
+    line()
+
+
+def c_resolve():
+    name = random.choice(["www", "api", "vpn", "mail", "sso"]) + "." + S.domain
+    type_cmd("Resolve-DnsName -Name %s -Type A -Server %s" % (name, pip4(4)))
+    nap(0.6, 1.2)
+    ps_table(["Name", "Type", "TTL", "Section", "IPAddress"], [[name, "A", str(random.choice([60, 300, 3600])), "Answer", "%d.%d.%d.%d" % (ri(34, 54), ri(1, 254), ri(1, 254), ri(1, 254))] for _ in range(ri(1, 3))])
+
+
+def c_nslookup():
+    name = random.choice(["fs01", "print01", "vpn", "sso"]) + "." + ad_domain()
+    dc = S.dc.lower() + "." + ad_domain()
+    type_cmd("nslookup %s %s" % (name, dc))
+    line("Server:  %s" % dc)
+    line("Address:  %s" % pip4(4))
+    line()
+    nap(0.5, 1)
+    line("Name:    %s" % name)
+    line("Address:  %s" % pip4(ri(5, 9)))
+    line()
+
+
+def c_testnet():
+    name = random.choice(["fs01", "exch01", "sql01", "web01"]) + "." + ad_domain()
+    port = random.choice([445, 443, 1433, 3389, 5985])
+    type_cmd("Test-NetConnection -ComputerName %s -Port %d" % (name, port))
+    nap(0.8, 1.8)
+    line()
+    ok = random.random() < 0.9
+    ps_list([("ComputerName", name), ("RemoteAddress", pip4(ri(5, 9))), ("RemotePort", str(port)), ("InterfaceAlias", "Ethernet0"),
+             ("SourceAddress", pip4(4)), ("TcpTestSucceeded", (GREEN if ok else RED) + str(ok) + R)], 16)
+    line()
+
+
+def c_pathping():
+    name = random.choice(["fs01", "sql01", "branch-gw", "web01"]) + "." + ad_domain()
+    dst = pip4(ri(5, 9))
+    mid = [pip4(255), pip4(254)][:ri(1, 2)]
+    hops = [("%s [%s]" % (S.dc.upper() + "." + ad_domain(), pip4(4)), None)] + [(m, ri(1, 6)) for m in ["10.%d.4.1" % NET] + mid] + [("%s [%s]" % (name, dst), ri(2, 9))]
+    type_cmd("pathping -q 50 %s" % name)
+    line()
+    line("Tracing route to %s [%s]" % (name, dst))
+    line("over a maximum of 30 hops:")
+    for i, (h, _) in enumerate(hops):
+        line("  %d  %s" % (i, h), 0.35)
+    line()
+    secs = len(hops) * 25
+    spin(lambda: "Computing statistics for %d seconds..." % secs, 3.5, YELLOW)
+    line("Computing statistics for %d seconds..." % secs)
+    line("            Source to Here   This Node/Link")
+    line("Hop  RTT    Lost/Sent = Pct  Lost/Sent = Pct  Address")
+    for i, (h, rtt) in enumerate(hops):
+        if i == 0:
+            line("  0                                           %s" % h, 0.05)
+            continue
+        lost = ri(0, 1) if random.random() < 0.15 else 0
+        line("                                %d/ 100 = %2d%%   |" % (lost, lost), 0.04)
+        line("%3d  %3dms  %3d/ 100 = %2d%%   %3d/ 100 = %2d%%  %s" % (i, rtt, lost, lost, 0, 0, h), 0.05)
+    line()
+    line("Trace complete.")
+    line()
+
+
+def c_tracert():
+    name = random.choice(["branch-gw", "web01", "vpn"]) + "." + S.domain
+    type_cmd("tracert -d %s" % name)
+    line()
+    line("Tracing route to %s [%d.%d.%d.%d]" % (name, ri(34, 54), ri(1, 254), ri(1, 254), ri(1, 254)))
+    line("over a maximum of 30 hops:")
+    line()
+    for i in range(1, ri(5, 9)):
+        t = [("<1" if random.random() < 0.3 and i < 3 else str(ri(i, i * 5 + 3))) for _ in range(3)]
+        if random.random() < 0.08:
+            line("%3d     *        *        *     Request timed out." % i, 0.4)
+        else:
+            line("%3d  %5s ms %5s ms %5s ms  %s" % (i, t[0], t[1], t[2], "10.%d.%d.%d" % (NET, ri(0, 255), ri(1, 254)) if i < 4 else "%d.%d.%d.%d" % (ri(4, 200), ri(1, 254), ri(1, 254), ri(1, 254))), 0.3)
+    line()
+    line("Trace complete.")
+    line()
+
+
+def c_repadmin():
+    d1, d2 = "DC01", "DC02"
+    type_cmd("repadmin /replsummary")
+    line("Replication Summary Start Time: %s" % when(0))
+    line()
+    line("Beginning data collection for replication summary, this may take awhile:")
+    out("  ")
+    for _ in range(ri(6, 12)):
+        out(".")
+        nap(0.2, 0.5)
+    out("\n\n\n")
+    line("Source DSA          largest delta    fails/total %   error")
+    for d in (d1, d2):
+        line(" %-18s %9s    %d /  %d    %d" % (d, "%02dm:%02ds" % (ri(1, 14), ri(0, 59)), 0, 10, 0), 0.05)
+    line()
+    line()
+    line("Destination DSA     largest delta    fails/total %   error")
+    for d in (d2, d1):
+        line(" %-18s %9s    %d /  %d    %d" % (d, "%02dm:%02ds" % (ri(1, 14), ri(0, 59)), 0, 10, 0), 0.05)
+    line()
+
+
+def c_dcdiag():
+    type_cmd("dcdiag /s:%s /test:replications /test:dns /test:services" % S.dc)
+    line()
+    line("Directory Server Diagnosis")
+    line()
+    line("Performing initial setup:")
+    line("   Trying to find home server...")
+    line("   Home Server = %s" % S.dc.upper())
+    line("   * Identified AD Forest.")
+    line("   Done gathering initial info.")
+    line()
+    line("Doing initial required tests")
+    line()
+    line("   Testing server: HQ\\%s" % S.dc.upper())
+    for t in ["Connectivity", "Replications", "Services", "DNS"]:
+        nap(0.5, 1.2)
+        line("      Starting test: %s" % t)
+        line("         ......................... %s %spassed%s test %s" % (S.dc.upper(), GREEN, R, t), 0.05)
+    line()
+
+
+def c_volume():
+    type_cmd("Get-Volume | Select-Object DriveLetter,FileSystemLabel,@{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}},@{n='FreeGB';e={[math]::Round($_.SizeRemaining/1GB,1)}}")
+    nap(0.6, 1.2)
+    ps_table(["DriveLetter", "FileSystemLabel", "SizeGB", "FreeGB"], [["C", "System", "127.4", "%d.%d" % (ri(20, 80), ri(0, 9))], ["D", "Data", "1023.9", "%d.%d" % (ri(100, 800), ri(0, 9))], ["E", "Logs", "255.9", "%d.%d" % (ri(30, 200), ri(0, 9))]])
+
+
+def c_dhcp():
+    sc = "10.%d.%d.0" % (NET, ri(0, 9))
+    type_cmd("Get-DhcpServerv4Lease -ScopeId %s | Select-Object -First 6 IPAddress,ClientId,HostName,LeaseExpiryTime" % sc)
+    nap(0.6, 1.2)
+    ps_table(["IPAddress", "ClientId", "HostName", "LeaseExpiryTime"], [[pip4(int(sc.split(".")[2])), wmac().lower(), "%s-%s.%s" % (random.choice(["lt", "ws", "mbp"]), sha(4), ad_domain()), when(0)] for _ in range(6)])
+
+
+def c_process():
+    type_cmd("Get-Process | Sort-Object CPU -Descending | Select-Object -First 7")
+    nap(0.5, 1)
+    line()
+    heads = " NPM(K)    PM(M)      WS(M)     CPU(s)      Id  SI ProcessName"
+    line(GREEN + B + heads + R, 0.02)
+    line(GREEN + B + " ------    -----      -----     ------      --  -- -----------" + R, 0.02)
+    for n in random.sample(["sqlservr", "w3wp", "lsass", "MsMpEng", "svchost", "dns", "ntfrs", "WmiPrvSE", "ismserv", "dfsrs"], 7):
+        line(" %6d %8.2f %10.2f %10.2f %7d %3d %s" % (ri(8, 120), random.uniform(10, 900), random.uniform(20, 1200), random.uniform(10, 9000), ri(400, 9999), 0, n), 0.04)
+    line()
+
+
+def c_hotfix():
+    type_cmd("Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 4")
+    nap(0.6, 1.2)
+    ps_table(["Source", "Description", "HotFixID", "InstalledBy", "InstalledOn"], [[S.dc.upper(), "Security Update", "KB50%05d" % ri(10000, 99999), "NT AUTHORITY\\SYSTEM", time.strftime("%m/%d/%Y", time.localtime(time.time() - ri(1, 60) * 86400))] for _ in range(4)])
+
+
+PS_CMDS = [c_aduser_filter, c_aduser_identity, c_locked, c_group, c_computers, c_services, c_eventlog, c_ipconfig,
+           c_resolve, c_nslookup, c_testnet, c_pathping, c_tracert, c_repadmin, c_dcdiag, c_volume, c_dhcp, c_process, c_hotfix]
+
+
+def sc_pssession():
+    S.dc = random.choice(["DC01", "DC02", "FS01", "ADMIN01"])
+    fqdn = "%s.%s" % (S.dc.lower(), ad_domain())
+    type_cmd("Enter-PSSession -ComputerName %s -Credential CORP\\svc-admin" % fqdn)
+    line("PowerShell credential request")
+    line("Enter your credentials.")
+    ask("Password for user CORP\\svc-admin: ", secret=True, wait=(4.0, 7.0))
+    S.remote = "[%s]: PS C:\\Users\\svc-admin\\Documents> " % fqdn
+    for fn in random.sample(PS_CMDS, ri(3, 5)):
+        nap(0.5, 1.4)
+        fn()
+    type_cmd("Exit-PSSession")
+    S.remote = None
+
+
+# ---- dns
+
+def _dig_head(q, status="NOERROR", ans=1, auth=0, flags="qr rd ra", extra=0):
+    line("; <<>> DiG 9.10.6 <<>> %s" % q)
+    line(";; global options: +cmd")
+    line(";; Got answer:")
+    line(";; ->>HEADER<<- opcode: QUERY, status: %s, id: %d" % (status, ri(1000, 65000)))
+    line(";; flags: %s; QUERY: 1, ANSWER: %d, AUTHORITY: %d, ADDITIONAL: %d" % (flags, ans, auth, 1 + extra))
+    line()
+    line(";; OPT PSEUDOSECTION:")
+    line("; EDNS: version: 0, flags:; udp: 1232")
+
+
+def _dig_foot(server="192.168.1.1"):
+    line()
+    line(";; Query time: %d msec" % ri(3, 60))
+    line(";; SERVER: %s#53(%s)" % (server, server))
+    line(";; WHEN: %s" % time.strftime("%a %b %d %H:%M:%S %Z %Y"))
+    line(";; MSG SIZE  rcvd: %d" % ri(60, 400))
+    line()
+
+
+def sc_dig():
+    d = S.domain
+    server = random.choice(["192.168.1.1", "10.%d.4.10" % NET, "1.1.1.1"])
+    kind = random.choice(["mx", "txt", "ns", "ptr", "dnssec", "trace", "short", "axfr"])
+    if kind == "mx":
+        type_cmd("dig %s MX" % d)
+        _dig_head("%s MX" % d, ans=5)
+        line(";; QUESTION SECTION:")
+        line(";%s.\t\t\tIN\tMX" % d)
+        line()
+        line(";; ANSWER SECTION:")
+        for p, h in [(1, "aspmx.l.google.com."), (5, "alt1.aspmx.l.google.com."), (5, "alt2.aspmx.l.google.com."), (10, "alt3.aspmx.l.google.com."), (10, "alt4.aspmx.l.google.com.")]:
+            line("%s.\t\t%d\tIN\tMX\t%d %s" % (d, ri(60, 3600), p, h), 0.05)
+        _dig_foot(server)
+    elif kind == "txt":
+        type_cmd("dig +noall +answer TXT %s _dmarc.%s" % (d, d))
+        line("%s.\t\t300\tIN\tTXT\t\"v=spf1 include:_spf.google.com include:mailgun.org ~all\"" % d)
+        line("%s.\t\t300\tIN\tTXT\t\"google-site-verification=%s\"" % (d, "".join(random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-", k=43))))
+        line("_dmarc.%s.\t300\tIN\tTXT\t\"v=DMARC1; p=quarantine; rua=mailto:dmarc@%s; pct=100\"" % (d, d))
+    elif kind == "ns":
+        type_cmd("dig %s NS +noall +answer +authority" % d)
+        for n in random.choice([["ns-%d.awsdns-%02d.org." % (ri(100, 999), ri(1, 63)), "ns-%d.awsdns-%02d.com." % (ri(100, 999), ri(1, 63)), "ns-%d.awsdns-%02d.net." % (ri(100, 999), ri(1, 63)), "ns-%d.awsdns-%02d.co.uk." % (ri(100, 999), ri(1, 63))], ["a.ns.%s." % d, "b.ns.%s." % d]]):
+            line("%s.\t\t172800\tIN\tNS\t%s" % (d, n), 0.05)
+    elif kind == "ptr":
+        ip = "%d.%d.%d.%d" % (ri(34, 54), ri(1, 254), ri(1, 254), ri(1, 254))
+        type_cmd("dig -x %s +short" % ip)
+        line("ec2-%s.%s.compute.amazonaws.com." % (ip.replace(".", "-"), REGION))
+    elif kind == "dnssec":
+        type_cmd("dig +dnssec www.%s A" % d)
+        _dig_head("+dnssec www.%s A" % d, ans=2, flags="qr rd ra ad")
+        line(";; QUESTION SECTION:")
+        line(";www.%s.\t\tIN\tA" % d)
+        line()
+        line(";; ANSWER SECTION:")
+        line("www.%s.\t300\tIN\tA\t%d.%d.%d.%d" % (d, ri(34, 54), ri(1, 254), ri(1, 254), ri(1, 254)))
+        sig = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", k=86))
+        line("www.%s.\t300\tIN\tRRSIG\tA 13 3 300 20261104000000 20261021000000 %d %s. %s==" % (d, ri(10000, 60000), d, sig))
+        _dig_foot(server)
+    elif kind == "trace":
+        tld = d.split(".")[-1]
+        type_cmd("dig +trace www.%s" % d)
+        line()
+        line("; <<>> DiG 9.10.6 <<>> +trace www.%s" % d)
+        line(";; global options: +cmd")
+        for c in "abcdefghijklm":
+            line(".\t\t\t518400\tIN\tNS\t%s.root-servers.net." % c, 0.02)
+        line(";; Received 525 bytes from %s#53(%s) in %d ms" % (server, server, ri(5, 40)))
+        line()
+        for c in "abcdefghijklm"[:ri(4, 8)]:
+            line("%s.\t\t172800\tIN\tNS\t%s0.nic.%s." % (tld, c, tld), 0.03)
+        line(";; Received 683 bytes from 198.41.0.4#53(a.root-servers.net) in %d ms" % ri(10, 60))
+        line()
+        for n in ["ns-%d.awsdns-%02d.com." % (ri(100, 999), ri(1, 63)), "ns-%d.awsdns-%02d.org." % (ri(100, 999), ri(1, 63))]:
+            line("%s.\t\t172800\tIN\tNS\t%s" % (d, n), 0.05)
+        line(";; Received 540 bytes from 199.7.83.42#53(%s0.nic.%s) in %d ms" % ("a", tld, ri(10, 80)))
+        line()
+        line("www.%s.\t300\tIN\tA\t%d.%d.%d.%d" % (d, ri(34, 54), ri(1, 254), ri(1, 254), ri(1, 254)))
+        line(";; Received 61 bytes from 205.251.%d.%d#53(ns-%d.awsdns-%02d.com) in %d ms" % (ri(192, 199), ri(1, 254), ri(100, 999), ri(1, 63), ri(8, 40)))
+        line()
+    elif kind == "short":
+        type_cmd("dig @%s +short A api.%s vpn.%s sso.%s" % (server, d, d, d))
+        for _ in range(3):
+            line("%d.%d.%d.%d" % (ri(34, 54), ri(1, 254), ri(1, 254), ri(1, 254)), 0.15)
+    else:
+        type_cmd("dig axfr %s @ns1.%s" % (d, d))
+        line()
+        line("; <<>> DiG 9.10.6 <<>> axfr %s @ns1.%s" % (d, d))
+        line(";; global options: +cmd")
+        line("; Transfer failed.")
+    line()
+
+
+# ---- network tools
+
+HOSTS = {
+    "linux-web": [(22, "ssh", "OpenSSH 9.6p1 Ubuntu 3ubuntu13.4 (Ubuntu Linux; protocol 2.0)"), (80, "http", "nginx 1.24.0 (Ubuntu)"), (443, "ssl/http", "nginx 1.24.0 (Ubuntu)")],
+    "windows-dc": [(53, "domain", "Simple DNS Plus"), (88, "kerberos-sec", "Microsoft Windows Kerberos (server time: %TIME%)"),
+                   (135, "msrpc", "Microsoft Windows RPC"), (389, "ldap", "Microsoft Windows Active Directory LDAP (Domain: %DOM%0., Site: HQ)"),
+                   (445, "microsoft-ds?", ""), (3389, "ms-wbt-server", "Microsoft Terminal Services")],
+    "printer": [(80, "http", "HP LaserJet Pro httpd"), (631, "ipp", "CUPS 2.4"), (9100, "jetdirect?", "")],
+    "database": [(22, "ssh", "OpenSSH 9.2p1 Debian 2+deb12u3 (protocol 2.0)"), (5432, "postgresql", "PostgreSQL DB 15.4 - 16.2"), (6379, "redis", "Redis key-value store 7.2.4")],
+    "nas": [(22, "ssh", "OpenSSH 8.4 (protocol 2.0)"), (445, "netbios-ssn", "Samba smbd 4.6.2"), (5000, "http", "nginx")],
+}
+
+
+def sc_nmap():
+    base = "10.%d.%d" % (NET, ri(0, 9))
+    type_cmd("sudo nmap -sS -sV -O -T4 %s.0/24" % base)
+    ask("Password:", secret=True, wait=(4.0, 7.0))
+    line("Starting Nmap 7.95 ( https://nmap.org ) at %s" % time.strftime("%Y-%m-%d %H:%M %Z"))
+    nh = ri(3, 6)
+    elapsed = 0
+    for phase in ["SYN Stealth Scan", "Service scan"]:
+        for pct_ in (ri(18, 35), ri(55, 78)):
+            nap(0.8, 1.6)
+            elapsed += ri(6, 14)
+            line("Stats: 0:00:%02d elapsed; %d hosts completed (%d up), %d undergoing %s" % (elapsed, ri(0, 2), nh, ri(1, 3), phase))
+            line("%s Timing: About %d.%02d%% done; ETC: %s (0:00:%02d remaining)" % (phase, pct_, ri(0, 99), time.strftime("%H:%M"), ri(8, 40)))
+    ips = random.sample(range(2, 250), nh)
+    for n, last in enumerate(ips):
+        kind = random.choice(list(HOSTS))
+        ip = "%s.%d" % (base, last)
+        nm = {"linux-web": "web", "windows-dc": "dc", "printer": "print", "database": "db", "nas": "nas"}[kind] + "%02d" % ri(1, 9)
+        line()
+        line("Nmap scan report for %s.%s (%s)" % (nm, ad_domain(), ip), 0.1)
+        line("Host is up (%.4fs latency)." % random.uniform(0.0004, 0.006))
+        svc = HOSTS[kind]
+        line("Not shown: %d closed tcp ports (reset)" % (1000 - len(svc)))
+        line(B + "%-9s %-5s %-13s %s" % ("PORT", "STATE", "SERVICE", "VERSION") + R)
+        for p, s, v in svc:
+            v = v.replace("%TIME%", time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime())).replace("%DOM%", ad_domain())
+            line("%-9s %s%-5s%s %-13s %s" % ("%d/tcp" % p, GREEN, "open", R, s, v), 0.06)
+        line("MAC Address: %s (%s)" % (":".join(wmac().split("-")), "VMware" if kind != "printer" else "Hewlett Packard"))
+        line("Device type: %s" % ("general purpose" if kind != "printer" else "printer"))
+        line("Running: %s" % {"linux-web": "Linux 5.X", "windows-dc": "Microsoft Windows 2019|2022", "printer": "HP embedded", "database": "Linux 5.X", "nas": "Linux 4.X"}[kind])
+        line("Network Distance: 1 hop")
+    line()
+    line("OS and Service detection performed. Please report any incorrect results at https://nmap.org/submit/ .")
+    line("Nmap done: 256 IP addresses (%d hosts up) scanned in %.2f seconds" % (nh, elapsed + random.uniform(4, 20)))
+
+
+def sc_tcpdump():
+    h1, h2, dns = pip4(4), pip4(ri(5, 9)), pip4(4)
+    type_cmd("sudo tcpdump -i en0 -n -c %d port 443 or port 53" % ri(18, 30))
+    ask("Password:", secret=True, wait=(4.0, 7.0))
+    line("tcpdump: verbose output suppressed, use -v[v]... for full protocol decode")
+    line("listening on en0, link-type EN10MB (Ethernet), snapshot length 524288 bytes")
+    seq = ri(1, 9999)
+    n = 0
+    t0 = time.time()
+    for _ in range(ri(18, 30)):
+        n += 1
+        ts = time.strftime("%H:%M:%S", time.localtime(t0)) + ".%06d" % ri(0, 999999)
+        t0 += random.uniform(0.01, 0.4)
+        r = random.random()
+        if r < 0.25:
+            q = random.randint(1000, 65000)
+            nm = random.choice(["api", "sso", "vpn", "www"]) + "." + S.domain
+            line("%s%s%s IP %s.%d > %s.53: %d+ A? %s. (%d)" % (GREY, ts, R, h1, ri(49152, 65000), dns, q, nm, len(nm) + 18), 0.08)
+            line("%s%s%s IP %s.53 > %s.%d: %d 1/0/0 A %s (%d)" % (GREY, ts, R, dns, h1, ri(49152, 65000), q, h2, len(nm) + 34), 0.08)
+        else:
+            ln = random.choice([0, 0, 31, 214, 517, 1448, 1448])
+            fl = "P." if ln else "."
+            a, b = (h1, h2) if random.random() < 0.5 else (h2, h1)
+            line("%s%s%s IP %s.%d > %s.443: Flags [%s], seq %d:%d, ack %d, win %d, options [nop,nop,TS val %d ecr %d], length %d" % (
+                GREY, ts, R, a, ri(49152, 65000), b, fl, seq, seq + ln, ri(1, 9999), ri(256, 4096), ri(10 ** 8, 10 ** 9), ri(10 ** 8, 10 ** 9), ln), 0.07)
+            seq += ln
+    line("%d packets captured" % n)
+    line("%d packets received by filter" % (n + ri(0, 40)))
+    line("0 packets dropped by kernel")
+
+
+def sc_openssl():
+    host = random.choice(["api", "sso", "vpn", "www"]) + "." + S.domain
+    ca, root = random.choice([("R11", "ISRG Root X1"), ("E6", "ISRG Root X2"), ("WE1", "GTS Root R4")])
+    org = "Let's Encrypt" if ca in ("R11", "E6") else "Google Trust Services"
+    type_cmd("openssl s_client -connect %s:443 -servername %s -showcerts </dev/null 2>/dev/null | grep -E 'subject|issuer|Verif|NotAfter|Protocol|Cipher'" % (host, host))
+    nap(0.8, 1.6)
+    nb = time.localtime(time.time() - ri(5, 60) * 86400)
+    na = time.localtime(time.time() + ri(5, 70) * 86400)
+    line("subject=CN=%s" % host)
+    line("issuer=C=US, O=%s, CN=%s" % (org, ca))
+    line("New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384")
+    line("    Protocol: TLSv1.3")
+    line("    Cipher: TLS_AES_256_GCM_SHA384")
+    line("    Verification: %sOK%s" % (GREEN, R))
+    line("notBefore=%s GMT" % time.strftime("%b %d %H:%M:%S %Y", nb))
+    line("notAfter=%s GMT" % time.strftime("%b %d %H:%M:%S %Y", na))
+    line("Verify return code: 0 (ok)")
+
+
+def sc_ifconfig():
+    iface = "en0"
+    type_cmd("ifconfig %s" % iface)
+    line("en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500")
+    line("\toptions=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>")
+    line("\tether %s" % ":".join("%02x" % ri(0, 255) for _ in range(6)))
+    line("\tinet6 fe80::%x:%x:%x:%x%%en0 prefixlen 64 secured scopeid 0xb" % (ri(0, 65535), ri(0, 65535), ri(0, 65535), ri(0, 65535)))
+    line("\tinet %s netmask 0xffffff00 broadcast 10.%d.4.255" % (pip4(4), NET))
+    line("\tnd6 options=201<PERFORMNUD,DAD>")
+    line("\tmedia: autoselect")
+    line("\tstatus: active")
+    type_cmd("scutil --dns | grep -E 'nameserver|domain|resolver #' | head -n 8")
+    line("resolver #1")
+    line("  search domain[0] : %s" % ad_domain())
+    line("  nameserver[0] : %s" % pip4(4))
+    line("  nameserver[1] : %s" % pip4(4))
+    line("resolver #2")
+    line("  domain   : local")
+    type_cmd("networksetup -getinfo Wi-Fi")
+    line("DHCP Configuration")
+    line("IP address: %s" % pip4(4))
+    line("Subnet mask: 255.255.255.0")
+    line("Router: 10.%d.4.1" % NET)
+    line("Client ID:")
+    line("IPv6: Automatic")
+
+
+def sc_lsof():
+    type_cmd("sudo lsof -iTCP -sTCP:LISTEN -n -P")
+    ask("Password:", secret=True, wait=(4.0, 7.0))
+    line(B + "%-14s %6s %-10s %4s %-9s %8s %-5s %s" % ("COMMAND", "PID", "USER", "FD", "TYPE", "NODE", "NAME", "") + R)
+    for cmd, port in random.sample([("sshd", 22), ("postgres", 5432), ("redis-ser", 6379), ("node", 3000), ("nginx", 80), ("nginx", 443), ("Python", 8000), ("ControlCe", 7000), ("rapportd", 49152)], ri(5, 8)):
+        line("%-14s %6d %-10s %4s %-9s %8s %-5s TCP *:%d (LISTEN)" % (cmd, ri(300, 99999), random.choice([S.user, "root", "_postgres"]), "%du" % ri(3, 40), "IPv4 0x%s" % sha(16), "0t0", "TCP", port), 0.08)
+    type_cmd("netstat -an | grep ESTABLISHED | head -n 6")
+    for _ in range(6):
+        line("tcp4       0      0  %s.%d  %s.443  ESTABLISHED" % (pip4(4), ri(49152, 65000), "%d.%d.%d.%d" % (ri(3, 54), ri(1, 254), ri(1, 254), ri(1, 254))), 0.06)
+
+
+def sc_mtr():
+    dst = "api." + S.domain
+    type_cmd("sudo mtr -n %s" % dst)
+    ask("Password:", secret=True, wait=(4.0, 7.0))
+    h, w = term_h(), min(term_w(), 110)
+    _alt_on()
+    nh = ri(6, 9)
+    ips = ["10.%d.4.1" % NET, pip4(255)] + ["%d.%d.%d.%d" % (ri(4, 200), ri(1, 254), ri(1, 254), ri(1, 254)) for _ in range(nh - 3)] + ["%d.%d.%d.%d" % (ri(34, 54), ri(1, 254), ri(1, 254), ri(1, 254))]
+    base = [1.0 + i * random.uniform(1, 5) for i in range(nh)]
+    loss = [0.0] * nh
+    hist = [[] for _ in range(nh)]
+    bad = ri(2, nh - 2) if random.random() < 0.5 else -1
+    for snt in range(1, ri(25, 40)):
+        out("\033[H")
+        out("%s My traceroute  [v0.95]%s\033[K\n" % (B, R))
+        out("%s (%s) -> %s%s\033[K\n\033[K\n" % (S.host, pip4(4), dst, ""))
+        out("%s%-4s%-18s %7s %5s %7s %7s %7s %7s  %s%s\033[K\n" % (INV, "", "Host", "Loss%", "Snt", "Last", "Avg", "Best", "Wrst", "Last 20 ", R))
+        for i in range(nh):
+            v = base[i] + random.uniform(0, 3) + (random.uniform(20, 60) if i == bad and random.random() < 0.3 else 0)
+            hist[i] = (hist[i] + [v])[-20:]
+            loss[i] = (loss[i] * (snt - 1) + (100 if random.random() < (0.12 if i == bad else 0.005) else 0)) / snt
+            col = RED if loss[i] > 5 else (YELLOW if loss[i] > 0 else GREEN)
+            out("%2d. %-18s %s%6.1f%%%s %5d %7.1f %7.1f %7.1f %7.1f  %s\033[K\n" % (
+                i + 1, ips[i], col, loss[i], R, snt, v, sum(hist[i]) / len(hist[i]), min(hist[i]), max(hist[i]), spark(hist[i], col)))
+        nap(0.15, 0.3)
+    _alt_off()
+
+
+def sc_subnet_map():
+    base = "10.%d.%d" % (NET, ri(0, 9))
+    type_cmd("./bin/subnet-map %s.0/24 --latency" % base)
+    line("%sScanning %s.0/24 (256 addresses)...%s" % (DIM, base, R))
+    up = set(random.sample(range(1, 255), ri(24, 70))) | {1}
+    lat = {i: random.choice([random.uniform(0.3, 3), random.uniform(1, 12), random.uniform(8, 60)]) for i in up}
+    grid = [["·"] * 16 for _ in range(16)]
+    cols = [[GREY] * 16 for _ in range(16)]
+    n = 0
+    first = True
+    for i in range(256):
+        r, c = divmod(i, 16)
+        if i in up:
+            ms = lat[i]
+            n += 1
+            grid[r][c] = "■"
+            cols[r][c] = GREEN if ms < 5 else (YELLOW if ms < 25 else RED)
+        if i % 4 == 3 or i == 255:
+            if not first:
+                out("\033[17A")
+            first = False
+            line("%s     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f   %s%d up%s" % (DIM, B + GREEN, n, R), 0)
+            for rr in range(16):
+                cells = "".join(" %s%s%s " % (cols[rr][cc], grid[rr][cc], R) for cc in range(16))
+                out("%s %x0%s %s\033[K\n" % (DIM, rr, R, cells))
+            nap(0.03, 0.08)
+    line("      %s■%s <5ms   %s■%s <25ms   %s■%s slow   %s·%s no reply" % (GREEN, R, YELLOW, R, RED, R, GREY, R))
+    line("%s%d hosts up%s, %d with latency above 25ms, gateway %s.1 responding in %.1fms" % (B, len(up), R, sum(1 for v in lat.values() if v >= 25), base, lat[1]))
+
+
+def sc_certs():
+    type_cmd("./bin/cert-check --all --warn 30")
+    names = random.sample(["api", "www", "vpn", "mail", "sso", "grafana", "git", "staging", "status", "docs", "intranet"], ri(7, 10))
+    line("%s%-34s %-44s %s%s" % (B, "HOST", "VALIDITY", "EXPIRES", R))
+    for nm in names:
+        spin(lambda: "checking %s.%s" % (nm, S.domain), random.uniform(0.2, 0.6), MAGENTA)
+        days = random.choice([ri(2, 14), ri(15, 29)] if random.random() < 0.2 else [ri(30, 89)])
+        col = RED if days < 15 else (YELLOW if days < 30 else GREEN)
+        exp = time.strftime("%Y-%m-%d", time.localtime(time.time() + days * 86400))
+        line("%-34s %s%s%s %3dd  %s %s" % ("%s.%s" % (nm, S.domain), col, bar(days / 90, 30), R, days, exp, ("⚠ renew" if days < 30 else "")), 0.02)
+    line("%s%d certificates checked%s" % (B, len(names), R))
+
+
+def sc_goaccess():
+    type_cmd("goaccess /var/log/nginx/access.log --log-format=COMBINED")
+    h, w = term_h(), min(term_w(), 120)
+    cw = (w - 1) // 2
+    cw2 = w - 1 - cw
+    _alt_on()
+    paths = ["/v2/orders", "/v2/sessions", "/static/app.js", "/", "/v2/health", "/assets/logo.svg", "/v2/accounts", "/login"]
+    base = [ri(2000, 60000) for _ in paths]
+    total = ri(40000, 900000)
+    codes = {"2xx": 0.91, "3xx": 0.05, "4xx": 0.03, "5xx": 0.01}
+    hours = [ri(10, 100) for _ in range(24)]
+    for f in range(ri(10, 16)):
+        total += ri(500, 4000)
+        base = [b + ri(0, 400) for b in base]
+        hours[-1] = max(5, hours[-1] + ri(-6, 12))
+        mx = max(base)
+        rows = ["%s%-18s%s %s%s%s %6d" % (CYAN, p, R, GREEN, bar(b / mx, 14), R, b) for p, b in sorted(zip(paths, base), key=lambda x: -x[1])[:6]]
+        stat = ["%s%-4s%s %s%s%s %5.1f%%" % (c_, k, R, c_, bar(v, 16), R, v * 100) for (k, v), c_ in zip(codes.items(), [GREEN, BLUE, YELLOW, RED])]
+        hmx = max(hours)
+        hr = [GREEN + "".join(" ▁▂▃▄▅▆▇█"[int(v / hmx * 8)] for v in hours) + R, "%s0h%s%s12h%s%s24h%s" % (DIM, R, " " * 9, DIM + R, " " * 8, DIM)]
+        head = ["%sTotal Requests%s %-9d   %sValid%s %-9d   %sUnique Visitors%s %-7d   %sBandwidth%s %.2f GiB" % (B, R, total, B, R, total - ri(0, 90), B, R, total // ri(8, 14), B, R, total * 0.00002)]
+        frame = [" %s GOACCESS %s %s" % (INV + B, R, time.strftime("%H:%M:%S"))] + head + [""]
+        frame += side(box("Requested Files", rows, cw, CYAN), box("HTTP Status Codes", stat, cw2, YELLOW), cw, cw2)
+        frame += side(box("Hourly Traffic", hr, cw, GREEN), box("Top Browsers", ["%-14s %s%s%s" % (n, MAGENTA, bar(v, 16), R) for n, v in [("Chrome", .58), ("Safari", .27), ("Firefox", .09), ("curl", .06)]], cw2, MAGENTA), cw, cw2)
+        out("\033[H" + "".join(l + "\033[K\n" for l in frame[:h - 1]))
+        nap(0.5, 1.0)
+    _alt_off()
+
+
+def sc_docker_stats():
+    type_cmd("docker stats")
+    names = random.sample(SERVICES + ["postgres", "redis", "nginx", "otel-collector"], ri(5, 8))
+    cids = [sha(12) for _ in names]
+    n = len(names)
+    first = True
+    for _ in range(ri(10, 18)):
+        out("\033[H\033[2J" if first else "\033[H")
+        first = False
+        out("%-14s %-18s %-8s %-22s %-8s %-16s %-14s %s\033[K\n" % ("CONTAINER ID", "NAME", "CPU %", "MEM USAGE / LIMIT", "MEM %", "NET I/O", "BLOCK I/O", "PIDS"))
+        for cid, nm in zip(cids, names):
+            mem = random.uniform(30, 900)
+            out("%-14s %-18s %-8s %-22s %-8s %-16s %-14s %d\033[K\n" % (cid, nm, "%.2f%%" % random.uniform(0.1, 60), "%.1fMiB / 7.65GiB" % mem, "%.2f%%" % (mem / 7830 * 100),
+                "%.1fMB / %.1fMB" % (random.uniform(0.5, 900), random.uniform(0.5, 400)), "%.1fMB / %.1fMB" % (random.uniform(0, 300), random.uniform(0, 90)), ri(3, 80)))
+        nap(0.4, 0.8)
+    out("^C\n")
+
+
+def sc_backup():
+    if random.random() < 0.5:
+        bucket = "%s-backups" % S.org
+        type_cmd("restic -r s3:s3.%s.amazonaws.com/%s backup ~/work --exclude node_modules --exclude .venv" % (REGION, bucket))
+        line("repository %s opened (version 2, compression level auto)" % sha(8))
+        line("using parent snapshot %s" % sha(8))
+        line("[0:01] 100.00%  4 / 4 index files loaded")
+        line()
+        tf = ri(1800, 4200)
+        tg = random.uniform(3, 9)
+        steps = ri(24, 40)
+        for i in range(1, steps + 1):
+            f = i / steps
+            out("\r[0:%02d] %5.2f%%  %d files %.3f GiB, total %d files %.3f GiB, 0 errors ETA 0:%02d\033[K" % (int(f * 30), f * 100, int(tf * f), tg * f, tf, tg, int((1 - f) * 20)))
+            nap(0.05, 0.15)
+        out("\n")
+        line()
+        line("Files:          %4d new,  %4d changed, %5d unmodified" % (ri(2, 60), ri(10, 140), tf))
+        line("Dirs:           %4d new,  %4d changed,  %4d unmodified" % (ri(0, 8), ri(5, 40), ri(200, 600)))
+        line("Added to the repository: %.3f GiB (%.3f MiB stored)" % (random.uniform(0.2, 2), random.uniform(80, 500)))
+        line()
+        line("processed %d files, %.3f GiB in 0:%02d" % (tf, tg, ri(25, 59)))
+        line("snapshot %s saved" % sha(8))
+    else:
+        type_cmd("rsync -avh --progress ~/work/ backup@nas.%s:/volume1/backup/work/" % S.domain)
+        line("sending incremental file list")
+        for f in random.sample(S.files, min(len(S.files), ri(3, 6))) + ["data/export-%s.csv" % sha(4)]:
+            line(f)
+            sz = ri(2, 900) * 10 ** ri(3, 5)
+            steps = ri(3, 7)
+            for i in range(1, steps + 1):
+                out("\r%15s %3d%%  %7.2fMB/s    0:00:%02d" % ("{:,}".format(sz * i // steps), i * 100 // steps, random.uniform(20, 140), max(0, steps - i)))
+                nap(0.06, 0.2)
+            out(" (xfr#%d, to-chk=%d/%d)\n" % (ri(1, 9), ri(20, 400), ri(420, 900)))
+        line()
+        line("sent %.2fM bytes  received %.2fK bytes  %.2fM bytes/sec" % (random.uniform(1, 900), random.uniform(1, 90), random.uniform(10, 90)))
+        line("total size is %.2fG  speedup is %.2f" % (random.uniform(2, 9), random.uniform(2, 60)))
+
+
+def sc_speedtest():
+    type_cmd("speedtest-cli")
+    line("Retrieving speedtest.net configuration...")
+    isp = random.choice(["Comcast Cable", "Verizon Fios", "Cox Communications", "Frontier Communications", "Lumen"])
+    line("Testing from %s (%d.%d.%d.%d)..." % (isp, ri(24, 100), ri(1, 254), ri(1, 254), ri(1, 254)))
+    line("Retrieving speedtest.net server list...")
+    line("Selecting best server based on ping...")
+    city = random.choice(["Seattle, WA", "Portland, OR", "San Jose, CA", "Boise, ID"])
+    line("Hosted by %s (%s) [%.2f km]: %.3f ms" % (random.choice(["Ziply Fiber", "Wave", "Cox", "Hurricane Electric"]), city, random.uniform(5, 300), random.uniform(6, 30)))
+    for label, rate in (("download", random.uniform(180, 940)), ("upload", random.uniform(20, 380))):
+        out("Testing %s speed" % label)
+        for _ in range(ri(40, 70)):
+            out(".")
+            nap(0.02, 0.06)
+        out("\n")
+        line("%s: %.2f Mbit/s" % (label.capitalize(), rate))
+
+
+def sc_brew():
+    type_cmd("brew update && brew upgrade")
+    line("%s==>%s %sAuto-updating Homebrew...%s" % (BLUE, R, B, R))
+    spin(lambda: "Updating Homebrew...", 2, BLUE)
+    line("%s==>%s %sUpdated Homebrew%s" % (BLUE, R, B, R))
+    pk = random.sample([("node", "22.1.0", "22.2.0"), ("postgresql@16", "16.2", "16.3"), ("git", "2.45.0", "2.45.1"), ("jq", "1.7", "1.7.1"),
+                        ("awscli", "2.15.40", "2.15.52"), ("terraform", "1.8.2", "1.8.4"), ("kubernetes-cli", "1.30.0", "1.30.1"), ("openssl@3", "3.3.0", "3.3.1"),
+                        ("wget", "1.24.5", "1.25.0"), ("ripgrep", "14.1.0", "14.1.1")], ri(2, 4))
+    line("%s==>%s %sUpgrading %d outdated packages:%s" % (BLUE, R, B, len(pk), R))
+    for n, a, b in pk:
+        line("%s %s -> %s" % (n, a, b), 0.05)
+    for n, a, b in pk:
+        line("%s==>%s %sFetching %s%s%s" % (BLUE, R, B, GREEN, n, R), 0.2)
+        line("%s==>%s %sDownloading https://ghcr.io/v2/homebrew/core/%s/blobs/sha256:%s%s" % (BLUE, R, B, n.split("@")[0], sha(64), R), 0.1)
+        steps = ri(10, 20)
+        for i in range(steps + 1):
+            out("\r%s %5.1f%%\033[K" % ("#" * int(i / steps * 68), i / steps * 100))
+            nap(0.03, 0.09)
+        out("\n")
+        line("%s==>%s %sPouring %s--%s.arm64_sequoia.bottle.tar.gz%s" % (BLUE, R, B, n, b, R), 0.2)
+        line("🍺  /opt/homebrew/Cellar/%s/%s: %s files, %.1fMB" % (n, b, "{:,}".format(ri(40, 4000)), random.uniform(1, 190)))
+    line("%s==>%s %sRunning `brew cleanup`...%s" % (BLUE, R, B, R))
+
+
+def sc_macadmin():
+    k = random.choice(["swupdate", "diskutil", "hw", "log"])
+    if k == "swupdate":
+        type_cmd("softwareupdate -l")
+        line("Software Update Tool")
+        line()
+        line("Finding available software")
+        nap(1, 2)
+        v = platform.mac_ver()[0] or "15.1"
+        line("Software Update found the following new or updated software:")
+        line("* Label: macOS Sequoia %s-%s" % (v, "24" + random.choice("FGH") + str(ri(100, 999))))
+        line("\tTitle: macOS Sequoia %s, Version: %s, Size: %dKiB, Recommended: YES, Action: restart, " % (v, v, ri(2000000, 3600000)))
+    elif k == "diskutil":
+        type_cmd("diskutil list internal")
+        line("/dev/disk0 (internal, physical):")
+        line("   #:                       TYPE NAME                    SIZE       IDENTIFIER")
+        line("   0:      GUID_partition_scheme                        *1.0 TB     disk0")
+        line("   1:             Apple_APFS_ISC Container disk1         524.3 MB   disk0s1")
+        line("   2:                 Apple_APFS Container disk3         994.7 GB   disk0s2")
+        line("   3:        Apple_APFS_Recovery Container disk2         5.4 GB     disk0s3")
+        line()
+        line("/dev/disk3 (synthesized):")
+        line("   #:                       TYPE NAME                    SIZE       IDENTIFIER")
+        line("   0:      APFS Container Scheme -                      +994.7 GB   disk3")
+        line("                                 Physical Store disk0s2")
+        line("   1:                APFS Volume Macintosh HD            %d.%d GB    disk3s1s1" % (ri(11, 14), ri(0, 9)))
+        line("   2:                APFS Volume Data                    %d.%d GB   disk3s5" % (ri(200, 600), ri(0, 9)))
+    elif k == "hw":
+        type_cmd("system_profiler SPHardwareDataType | head -n 14")
+        line("Hardware:")
+        line()
+        line("    Hardware Overview:")
+        line()
+        line("      Model Name: MacBook Pro")
+        line("      Model Identifier: Mac14,10")
+        line("      Chip: Apple M2 Pro")
+        line("      Total Number of Cores: 12 (8 performance and 4 efficiency)")
+        line("      Memory: 16 GB")
+        line("      System Firmware Version: %d.%d.%d" % (ri(10000, 11000), ri(0, 99), ri(0, 9)))
+        line("      Serial Number (system): %s" % "".join(random.choices("ABCDEFGHJKLMNPQRSTVWXYZ0123456789", k=10)))
+        line("      Activation Lock Status: Disabled")
+    else:
+        type_cmd("log stream --predicate 'process == \"sshd\"' --style compact")
+        line("Filtering the log data using \"process == \"sshd\"\"")
+        line("Timestamp               Ty Process[PID:TID]")
+        ip = pip4(4)
+        for m in ["Connection from %s port %d on %s port 22" % (ip, ri(49152, 65000), pip4(4)), "Accepted publickey for deploy from %s port %d ssh2: ED25519 SHA256:%s" % (ip, ri(49152, 65000), sha(16)),
+                  "Starting session: shell on ttys%03d for deploy from %s port %d" % (ri(0, 20), ip, ri(49152, 65000)), "Received disconnect from %s port %d:11: disconnected by user" % (ip, ri(49152, 65000))]:
+            line("%s Df sshd[%d:%x] %s" % (time.strftime("%Y-%m-%d %H:%M:%S.") + "%03d-0700" % ri(0, 999), ri(100, 9999), ri(0x1000, 0xfffff), m), 0.4)
+        out("^C\n")
+
+
+def sc_ansible():
+    grp = random.choice(["webservers", "dbservers", "bastions", "workers"])
+    type_cmd("ansible-playbook -i inventory/prod site.yml --limit %s" % grp)
+    short = {"webservers": "web", "dbservers": "db", "bastions": "bastion", "workers": "worker"}[grp]
+    hosts = ["%s-%02d" % (short, i) for i in range(1, ri(3, 5))]
+    stats = {h: [0, 0, 0] for h in hosts}  # ok, changed, unreachable
+    w = 79
+    bad = random.choice(hosts) if random.random() < 0.2 else None
+
+    def hdr(kind, name):
+        t = "%s [%s] " % (kind, name)
+        line()
+        line(t + "*" * max(3, w - len(t)))
+
+    hdr("PLAY", "Configure %s" % grp)
+    for task in ["Gathering Facts"] + random.sample(["common : Install base packages", "common : Set timezone", "nginx : Install nginx", "nginx : Template vhost config",
+                                                      "nginx : Ensure service is running", "app : Pull release artifact", "app : Restart app service", "ssh : Harden sshd_config",
+                                                      "monitoring : Deploy node_exporter", "firewall : Allow 443/tcp"], ri(4, 7)):
+        hdr("TASK", task)
+        for h in hosts:
+            if h == bad and stats[h][2] == 0 and random.random() < 0.5:
+                stats[h][2] = 1
+                line("%sfatal: [%s]: UNREACHABLE! => {\"changed\": false, \"msg\": \"Failed to connect to the host via ssh: ssh: connect to host 10.%d.%d.%d port 22: Operation timed out\", \"unreachable\": true}%s" % (RED, h, NET, ri(0, 9), ri(2, 250), R))
+                continue
+            if stats[h][2]:
+                continue
+            ch = random.random() < 0.3 and task != "Gathering Facts"
+            stats[h][1 if ch else 0] += 1
+            line("%s%s: [%s]%s" % (YELLOW if ch else GREEN, "changed" if ch else "ok", h, R), 0.12)
+    line()
+    line("PLAY RECAP " + "*" * (w - 11))
+    for h in hosts:
+        ok, chg, un = stats[h]
+        line("%-26s : %sok=%-4d%s %schanged=%-4d%s %sunreachable=%-4d%s failed=0    skipped=%-4d rescued=0    ignored=0" % (
+            h, GREEN, ok + chg, R, YELLOW if chg else "", chg, R, RED if un else "", un, R, ri(0, 3)), 0.1)
+
+
+def sc_gantt():
+    type_cmd("./bin/pipeline timeline --last")
+    jobs = [("checkout", 0, 6), ("lint", 6, 22), ("unit-tests", 6, 70), ("integration", 28, 95), ("build-image", 70, 60), ("scan-image", 130, 42), ("push-ecr", 130, 25), ("deploy-staging", 172, 48), ("smoke", 220, 30)]
+    total = max(s + d for _, s, d in jobs)
+    tw = max(30, min(60, term_w() - 36))
+    line("%sPipeline #%d   %s   %dm%02ds%s" % (B, ri(1000, 9999), S.branch, total // 60, total % 60, R))
+    axis = "".join(("|" if (i * total // tw) % 60 < total / tw else "─") for i in range(tw))
+    line("%s%-16s %s%s" % (DIM, "", axis, R))
+    crit = {"checkout", "unit-tests", "build-image", "push-ecr", "deploy-staging", "smoke"}
+    for n, s, d in jobs:
+        off = int(s / total * tw)
+        ln = max(1, int(d / total * tw))
+        col = GREEN if random.random() > 0.12 else YELLOW
+        line("%-16s %s%s%s%s %s%3ds%s %s" % (n, " " * off, col, "▄" * ln, R, DIM, d, R, (CYAN + "◆" + R) if n in crit else ""), 0.09)
+    line("%s◆ critical path%s   %ssaved %ds by running lint and unit-tests in parallel%s" % (CYAN, R, DIM, ri(20, 90), R))
+
+
+def sc_git_diff():
+    name, lang, code = random.choice(SNIPPETS[S.stack])
+    k = ri(1, max(1, len(code) - 7))
+    ctx = code[k:k + 7]
+    type_cmd("git diff -U2 %s" % name)
+    line("%sdiff --git a/%s b/%s%s" % (B, name, name, R))
+    line("%sindex %s..%s 100644%s" % (B, sha(), sha(), R))
+    line("%s--- a/%s%s" % (B, name, R))
+    line("%s+++ b/%s%s" % (B, name, R))
+    line("%s@@ -%d,%d +%d,%d @@%s" % (CYAN, k, len(ctx), k, len(ctx) + 1, R))
+    mid = len(ctx) // 2
+    for i, c in enumerate(ctx):
+        if i == mid:
+            line("%s-%s%s" % (RED, c, R), 0.06)
+            line("%s+%s%s" % (GREEN, c.rstrip() + "  # tightened", R) if lang == "python" else "%s+%s%s" % (GREEN, c, R), 0.06)
+            line("%s+%s%s" % (GREEN, " " * (len(c) - len(c.lstrip())) + ("log.debug('retrying')" if lang == "python" else "// retry path"), R), 0.06)
+        else:
+            line(" " + c, 0.04)
+
+
+def sc_bat():
+    name, lang, code = random.choice(SNIPPETS[S.stack])
+    type_cmd("bat %s" % name)
+    w = min(term_w(), 100)
+    line("%s%s┬%s%s" % (GREY, "─" * 7, "─" * (w - 8), R), 0.01)
+    line("%s       │ %sFile: %s%s%s" % (GREY, R, B, name, R), 0.01)
+    line("%s%s┼%s%s" % (GREY, "─" * 7, "─" * (w - 8), R), 0.01)
+    for i, c in enumerate(code, 1):
+        line("%s %4d   │%s %s" % (GREY, i, R, highlight(c, lang)), 0.03)
+    line("%s%s┴%s%s" % (GREY, "─" * 7, "─" * (w - 8), R), 0.01)
+
+
+def sc_ls():
+    type_cmd("ls -lah")
+    tops = sorted({f.split("/")[0] for f in S.files})
+    dirs = [t for t in tops if not "." in t] + [".git"]
+    files = [t for t in tops if "." in t] + ["README.md", ".gitignore", "LICENSE"]
+    line("total %d" % ri(40, 400))
+    line("%sdrwxr-xr-x%s  %2d %s  staff   %4dB %s %s" % ("", "", ri(8, 30), S.user, ri(256, 1024), time.strftime("%b %d %H:%M"), B + BLUE + "." + R), 0.02)
+    line("drwxr-xr-x  %2d %s  staff   %4dB %s %s" % (ri(40, 80), S.user, ri(1024, 4096), time.strftime("%b %d %H:%M"), B + BLUE + ".." + R), 0.02)
+    for d in dirs:
+        line("drwxr-xr-x  %2d %s  staff   %4dB %s %s" % (ri(3, 20), S.user, ri(96, 640), time.strftime("%b %d %H:%M", time.localtime(time.time() - ri(0, 9) * 86400)), B + BLUE + d + R), 0.02)
+    for f in files:
+        exe = f.endswith((".sh",))
+        line("%s  1 %s  staff  %5s %s %s" % ("-rwxr-xr-x" if exe else "-rw-r--r--", S.user, "%dB" % ri(120, 999) if random.random() < 0.5 else "%.1fK" % random.uniform(1, 90), time.strftime("%b %d %H:%M", time.localtime(time.time() - ri(0, 30) * 86400)), (RED if exe else "") + f + R), 0.02)
+
+
+def sc_history():
+    type_cmd("history | tail -n 14")
+    pool = ["git status", "git pull --rebase", "docker compose up -d", "kubectl get pods -n production", "cd ../%s" % S.proj, "npm run lint", "terraform plan", "dig +short api.%s" % S.domain,
+            "ssh deploy@bastion", "pytest -x", "ls -la", "aws sts get-caller-identity", "make build", "tail -f logs/app.log", "git log --oneline -n 10", "vim README.md", "brew upgrade", "htop",
+            "curl -s localhost:8080/health | jq .", "ping -c 3 10.%d.4.1" % NET, "nmap -sn 10.%d.4.0/24" % NET]
+    n = ri(2000, 9000)
+    for i, c in enumerate(random.sample(pool, 14)):
+        line("%5d  %s" % (n + i, c), 0.03)
+
+
+def sc_idle():
+    out(prompt())
+    nap(3, 6)
+    type_text("clear")
+    nap(0.3, 0.6)
+    out("\n\033[2J\033[H")
 
 
 # ------------------------------------------------------------------- main
@@ -1796,7 +2735,15 @@ SCENARIOS = [
     (sc_dashboard, 3, None), (sc_release, 2, None), (sc_docker_pull, 3, None), (sc_gh_run, 3, None),
     (sc_traces, 3, None), (sc_heatmap, 2, None), (sc_areachart, 3, None), (sc_matrix, 2, None),
     (sc_topology, 3, None), (sc_ncdu, 1, None),
-    (sc_flame, 2, None), (sc_cloc, 1, None), (sc_tree, 1, None), (sc_ping, 1, None), (sc_secrets, 3, None),
+    (sc_flame, 2, None),
+    (sc_pssession, 1, None), (sc_dig, 2, None), (sc_nmap, 1, None), (sc_tcpdump, 1, None), (sc_openssl, 1, None),
+    (sc_ifconfig, 1, None), (sc_lsof, 1, None), (sc_mtr, 2, None), (sc_subnet_map, 2, None), (sc_certs, 2, None),
+    (sc_goaccess, 2, None), (sc_docker_stats, 1, None), (sc_backup, 2, None), (sc_speedtest, 1, None), (sc_brew, 1, None),
+    (sc_macadmin, 2, None), (sc_ansible, 2, None), (sc_gantt, 2, None), (sc_git_diff, 2, None), (sc_bat, 2, None),
+    (sc_ls, 2, None), (sc_history, 1, None), (sc_idle, 1, None),
+    (sc_pssession, 5, {"it"}), (sc_dig, 4, {"it"}), (sc_nmap, 4, {"it"}), (sc_tcpdump, 3, {"it"}), (sc_openssl, 3, {"it"}),
+    (sc_ifconfig, 3, {"it"}), (sc_lsof, 3, {"it"}), (sc_mtr, 4, {"it"}), (sc_subnet_map, 4, {"it"}), (sc_certs, 4, {"it"}),
+    (sc_ansible, 5, {"it"}), (sc_macadmin, 3, {"it"}), (sc_cloc, 1, None), (sc_tree, 1, None), (sc_ping, 1, None), (sc_secrets, 3, None),
     (sc_npm, 3, {"node"}), (sc_vite, 2, {"node"}), (sc_jest, 3, {"node"}),
     (sc_pip, 3, {"python"}), (sc_pytest, 4, {"python"}), (sc_mypy, 2, {"python"}),
     (sc_python_crash, 2, {"python"}),
@@ -1839,9 +2786,12 @@ def main():
     switch_project(first=True)
     count = 0
     until_ask = ri(3, 5)
+    mood = 1.0
     try:
         while True:
-            nap(0.3, 1.1)
+            if count % ri(4, 8) == 0:
+                mood = random.choice([0.4, 0.7, 1.0, 1.0, 1.5, 2.5])  # bursts and lulls
+            nap(0.3 * mood, 1.1 * mood)
             if S.queue:
                 S.queue.pop(0)()
             elif until_ask <= 0:
