@@ -14,11 +14,13 @@ Python 3.8+ standard library only, so it runs on any stock Mac.
 import argparse
 import atexit
 import getpass
+import os
 import platform
 import random
 import re
 import select
 import shutil
+import signal
 import socket
 import sys
 import time
@@ -60,6 +62,8 @@ S.recent = []
 S.alt = False
 S.dirty = True
 S.remote = None
+S.rtitle = None
+S.role = "all"
 S.tty = sys.stdin.isatty() and sys.stdout.isatty()
 S.saved_tty = None
 
@@ -67,6 +71,30 @@ S.saved_tty = None
 def out(s):
     sys.stdout.write(s)
     sys.stdout.flush()
+
+
+def title(t):
+    """Window/tab title, the way Terminal.app shows 'folder - process - 80x24'."""
+    if S.tty:
+        out("\033]0;%s\007" % t)
+
+
+def retitle(cmd=None):
+    if S.rtitle:  # inside ssh / pwsh / psql / a REPL: the title is the session, not each command
+        title("%s \u2014 %d\u00d7%d" % (S.rtitle, term_w(), term_h()))
+        return
+    exe = "-zsh"
+    if cmd:
+        parts = [p for p in cmd.split() if p not in ("sudo", "time", "env")]
+        exe = os.path.basename(parts[0]) if parts else "zsh"
+    where = S.rtitle or (S.proj if hasattr(S, "proj") else "~")
+    title("%s \u2014 %s \u2014 %d\u00d7%d" % (where, exe, term_w(), term_h()))
+
+
+def _on_winch(sig, frame):
+    S.resized = True
+    if S.alt:  # full-screen scene: wipe stale cells, the next frame repaints
+        out("\033[2J\033[H")
 
 
 def nap(a, b=None):
@@ -174,6 +202,7 @@ def prompt():
 
 def type_cmd(cmd, pr=None):
     out(prompt() if pr is None else pr)
+    retitle()
     nap(0.3, 1.2)
     if len(cmd) > 10 and random.random() < 0.07:
         p = ri(4, len(cmd) - 3)
@@ -186,6 +215,7 @@ def type_cmd(cmd, pr=None):
         type_text(cmd)
     nap(0.15, 0.5)
     out("\n")
+    retitle(cmd)
 
 
 # ---------------------------------------------------- the user interrupts
@@ -248,6 +278,7 @@ def cleanup():
         out("\033[?1049l")
         S.alt = False
     out("\033[?25h" + R)
+    retitle()
     if S.saved_tty and termios:
         try:
             termios.tcsetattr(0, termios.TCSADRAIN, S.saved_tty)
@@ -268,9 +299,18 @@ PROJECTS = [
     ("netops-toolkit", "it", "northwind"),
     ("corp-it-scripts", "it", "helix-systems"),
     ("ansible-fleet", "it", "brightpath"),
+    ("churn-model", "data", "brightpath"),
+    ("forecast-lab", "data", "vantage-io"),
+    ("etl-pipelines", "data", "helix-systems"),
+    ("sentinel-scan", "sec", "northwind"),
+    ("soc-automation", "sec", "acme-labs"),
 ]
 
 FILES = {
+    "data": ["src/features/build.py", "src/models/train.py", "notebooks/eda.ipynb", "configs/churn.yaml",
+             "src/eval/report.py", "dags/daily_refresh.py", "pyproject.toml"],
+    "sec": ["scanners/ports.py", "scanners/tls.py", "rules/ssh_bruteforce.yml", "playbooks/isolate_host.py",
+            "siem/parsers/auth.py", "tests/test_rules.py", "pyproject.toml"],
     "it": ["scripts/Get-StaleAccounts.ps1", "scripts/Reset-UserPassword.ps1", "dns/zones/corp.zone", "dhcp/scopes.json",
            "firewall/rules.yaml", "ansible/site.yml", "ansible/roles/nginx/tasks/main.yml", "docs/runbook.md"],
     "node": ["src/components/Header.tsx", "src/hooks/useSession.ts", "src/api/client.ts",
@@ -715,12 +755,14 @@ def sc_mypy():
 # --------------------------------------------------------------- docker
 
 BASE = {"it": "alpine:3.19", "node": "node:20-alpine", "python": "python:3.12-slim", "rust": "rust:1.78-slim",
-        "go": "golang:1.22-alpine", "infra": "alpine:3.19"}
+        "go": "golang:1.22-alpine", "infra": "alpine:3.19", "data": "python:3.12-slim", "sec": "python:3.12-slim"}
 RUN = {"it": ["RUN apk add --no-cache ansible bind-tools nmap", "RUN pip install --no-cache-dir pywinrm"], "node": ["RUN npm ci --omit=dev", "RUN npm run build"],
        "python": ["RUN pip install --no-cache-dir -r requirements.txt", "RUN python -m compileall app"],
        "rust": ["RUN cargo fetch", "RUN cargo build --release"],
        "go": ["RUN go mod download", "RUN CGO_ENABLED=0 go build -o /bin/app ./cmd/server"],
-       "infra": ["RUN apk add --no-cache terraform kubectl", "RUN terraform init -backend=false"]}
+       "infra": ["RUN apk add --no-cache terraform kubectl", "RUN terraform init -backend=false"],
+       "data": ["RUN pip install --no-cache-dir -r requirements.txt", "RUN python -m compileall src"],
+       "sec": ["RUN pip install --no-cache-dir -r requirements.txt", "RUN python -m compileall scanners"]}
 
 
 def sc_docker_build():
@@ -1019,6 +1061,7 @@ def sc_ssh(wait=True):
     line("Last login: %s from 10.%d.%d.%d" % (time.strftime("%a %b %d %H:%M:%S %Y"), ri(0, 255), ri(0, 255), ri(2, 250)))
     pr = "%s@%s:~$ " % ("deploy", short)
     S.remote = GREEN + B + "deploy@" + short + R + ":" + BLUE + B + "~" + R + "$ "
+    S.rtitle = "deploy@" + short
     type_cmd("uptime")
     line(" %s up %d days, %2d:%02d,  1 user,  load average: %.2f, %.2f, %.2f" % (time.strftime("%H:%M:%S"), ri(3, 90), ri(0, 23), ri(0, 59), random.uniform(0.1, 1.5), random.uniform(0.1, 1.5), random.uniform(0.1, 1.5)))
     type_cmd("df -h /")
@@ -1035,6 +1078,7 @@ def sc_ssh(wait=True):
     line("        CPU: %dh %dmin %d.%03ds" % (ri(0, 9), ri(0, 59), ri(0, 59), ri(0, 999)))
     type_cmd("exit")
     S.remote = None
+    S.rtitle = None
     line("logout")
     line("Connection to %s closed." % host)
 
@@ -1077,6 +1121,27 @@ def sc_sudo_brew():
 # --------------------------------------------------------------- the editor
 
 SNIPPETS = {
+    "data": [
+        ("src/features/build.py", "python", [
+            "def build_features(df: pd.DataFrame) -> pd.DataFrame:", "    df = df.sort_values(['customer_id', 'ts'])",
+            "    g = df.groupby('customer_id')", "    df['orders_30d'] = g['order_id'].transform(lambda s: s.rolling('30D').count())",
+            "    df['days_since_last'] = g['ts'].diff().dt.days.fillna(999)", "    df['aov'] = df['amount'] / df['quantity'].clip(lower=1)",
+            "    return df.drop(columns=['raw_payload'])"]),
+        ("src/models/train.py", "python", [
+            "def fit(cfg, train, val):", "    model = build_model(cfg.model)", "    opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)",
+            "    for epoch in range(cfg.epochs):", "        for x, y in train:", "            opt.zero_grad()", "            loss = F.cross_entropy(model(x), y)",
+            "            loss.backward()", "            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)", "            opt.step()"]),
+    ],
+    "sec": [
+        ("scanners/ports.py", "python", [
+            "async def probe(host: str, port: int, timeout: float = 1.5) -> bool:", "    try:",
+            "        fut = asyncio.open_connection(host, port)", "        _, writer = await asyncio.wait_for(fut, timeout)",
+            "        writer.close()", "        return True", "    except (OSError, asyncio.TimeoutError):", "        return False"]),
+        ("siem/parsers/auth.py", "python", [
+            "PATTERN = re.compile(r'Failed password for (?:invalid user )?(\\S+) from (\\d+\\.\\d+\\.\\d+\\.\\d+)')", "",
+            "def parse(line: str):", "    m = PATTERN.search(line)", "    if not m:", "        return None",
+            "    user, ip = m.groups()", "    return {'event': 'ssh_fail', 'user': user, 'src_ip': ip}"]),
+    ],
     "it": [
         ("scripts/Get-StaleAccounts.ps1", "ps", [
             "function Get-StaleAccounts {", "    param([int]$Days = 90)", "    $cutoff = (Get-Date).AddDays(-$Days)",
@@ -1210,10 +1275,11 @@ def highlight(text, lang):
     return _HL[lang].sub(lambda m: col[m.lastgroup] + m.group() + R, text)
 
 
-def sc_editor():
+def sc_editor(fname=None):
     pool = [x for x in SNIPPETS[S.stack] if x[0] != getattr(S, "last_snip", None)] or SNIPPETS[S.stack]
     name, lang, code = random.choice(pool)
     S.last_snip = name
+    name = fname or name
     h = term_h()
     code = code[:max(6, h - 4)]
     type_cmd("vim %s" % name)
@@ -1298,7 +1364,7 @@ def sc_fetch():
         "%sKernel%s: Darwin %s" % (B + CYAN, R, platform.release()),
         "%sUptime%s: %d days, %d hours, %d mins" % (B + CYAN, R, ri(0, 12), ri(0, 23), ri(0, 59)),
         "%sShell%s: zsh 5.9" % (B + CYAN, R), "%sTerminal%s: Terminal.app" % (B + CYAN, R),
-        "%sCPU%s: Apple M2 Pro (12) @ 3.50 GHz" % (B + CYAN, R),
+        "%sCPU%s: Apple M2 Pro (%d) @ 3.50 GHz" % (B + CYAN, R, os.cpu_count() or 12),
         "%sMemory%s: %d MiB / 16384 MiB" % (B + CYAN, R, mem),
         "%sDisk%s: %d GiB / 926 GiB (%d%%)" % (B + CYAN, R, ri(200, 600), ri(25, 65)),
         "", "".join(sgr(40 + i) + "   " for i in range(8)) + R, "".join(sgr(100 + i) + "   " for i in range(8)) + R,
@@ -1518,7 +1584,8 @@ def sc_cloc():
     langs = {"node": ["TypeScript", "JSON", "CSS", "Markdown", "YAML"], "python": ["Python", "YAML", "SQL", "Markdown", "TOML"],
              "rust": ["Rust", "TOML", "SQL", "Markdown", "YAML"], "go": ["Go", "YAML", "SQL", "Markdown", "Dockerfile"],
              "infra": ["HCL", "YAML", "Bourne Shell", "Markdown", "JSON"],
-             "it": ["PowerShell", "YAML", "Bourne Shell", "JSON", "Markdown"]}[S.stack]
+             "it": ["PowerShell", "YAML", "Bourne Shell", "JSON", "Markdown"],
+             "data": ["Python", "Jupyter Notebook", "YAML", "SQL", "Markdown"], "sec": ["Python", "YAML", "Bourne Shell", "JSON", "Markdown"]}[S.stack]
     w = 79
     line("      %d text files." % ri(200, 900))
     line("      %d unique files." % ri(180, 800))
@@ -1720,6 +1787,9 @@ def sc_matrix():
     trail = [ri(6, h // 2 + 4) for _ in range(w)]
     frames = ri(55, 80)
     for f in range(frames):
+        if (term_w(), term_h()) != (w, h):  # resized mid-rain: end the effect early
+            out("\033[2J")
+            break
         buf = []
         for x in range(w):
             y = drops[x]
@@ -1740,6 +1810,7 @@ def sc_matrix():
                 drops[x] = None
         out("".join(buf) + R)
         nap(0.04, 0.06)
+    w, h = term_w(), term_h()
     top = max(1, h // 2 - 2)
     lft = max(1, (w - 34) // 2)
     out(R)
@@ -1794,7 +1865,8 @@ def sc_ncdu():
             "rust": ["target", ".git", "src", "benches", "docs", "migrations"],
             "go": [".git", "vendor", "bin", "internal", "cmd", "pkg"],
             "infra": [".terraform", ".git", "modules", "envs", "k8s", "docs"],
-            "it": [".git", "scripts", "ansible", "dns", "dhcp", "docs"]}[S.stack]
+            "it": [".git", "scripts", "ansible", "dns", "dhcp", "docs"],
+            "data": [".venv", ".git", "data", "notebooks", "models", "src"], "sec": [".git", "scanners", "rules", "playbooks", "siem", "tests"]}[S.stack]
     sizes = sorted([random.uniform(2, 1800) * (1 if d not in (".git", "src", "app", "internal") else 0.2) for d in dirs], reverse=True)
     line("%s--- /Users/%s/work/%s %s---" % (B, S.user, S.proj, "-" * 30) + R)
     top = sizes[0]
@@ -2116,11 +2188,13 @@ def sc_pssession():
     line("Enter your credentials.")
     ask("Password for user CORP\\svc-admin: ", secret=True, wait=(4.0, 7.0))
     S.remote = "[%s]: PS C:\\Users\\svc-admin\\Documents> " % fqdn
+    S.rtitle = "pwsh"
     for fn in random.sample(PS_CMDS, ri(3, 5)):
         nap(0.5, 1.4)
         fn()
     type_cmd("Exit-PSSession")
     S.remote = None
+    S.rtitle = None
 
 
 # ---- dns
@@ -2724,6 +2798,1074 @@ def sc_idle():
     out("\n\033[2J\033[H")
 
 
+# ------------------------------------------------------------ real identity
+
+def sc_whoami():
+    type_cmd("whoami")
+    line(S.user)
+    type_cmd("hostname")
+    line(socket.gethostname())
+    type_cmd("id")
+    try:
+        uid, gid = os.getuid(), os.getgid()
+    except AttributeError:
+        uid, gid = 501, 20
+    line("uid=%d(%s) gid=%d(staff) groups=%d(staff),12(everyone),61(localaccounts),79(_appserverusr),80(admin),"
+         "81(_appserveradm),98(_lpadmin),33(_appstore),100(_lpoperator),204(_developer),250(_analyticsusers),"
+         "395(com.apple.access_ftp),398(com.apple.access_screensharing),399(com.apple.access_ssh)" % (uid, S.user, gid, gid))
+    if random.random() < 0.5:
+        type_cmd("sw_vers")
+        line("ProductName:\t\tmacOS")
+        line("ProductVersion:\t\t%s" % (platform.mac_ver()[0] or "15.1"))
+        line("BuildVersion:\t\t%02d%s%d" % (ri(23, 26), random.choice("ABCDEFG"), ri(100, 999)))
+    else:
+        type_cmd("uname -a")
+        line("Darwin %s %s %s %s" % (socket.gethostname(), platform.release(), platform.version(), platform.machine()))
+
+
+# ----------------------------------------------------------- data / ML
+
+DATASETS = ["churn", "fraud", "demand", "sentiment", "recsys", "ltv", "eta"]
+MODELS = ["xgboost", "resnet18", "lstm-attn", "transformer-small", "tabnet", "lightgbm"]
+
+
+def _curve(n, start, end, noise=0.03):
+    vals = []
+    for i in range(n):
+        f = i / max(1, n - 1)
+        vals.append(max(0.001, start * (end / start) ** (f ** 0.7) + random.uniform(-noise, noise) * start * (1 - f)))
+    return vals
+
+
+def sc_train(diverge=False, ds=None):
+    ds = ds or random.choice(DATASETS)
+    model = random.choice(MODELS)
+    n = ri(8, 12)
+    type_cmd("python -m trainer.fit --config configs/%s.yaml --epochs %d" % (ds, n))
+    nap(0.5, 1.2)
+    line("Seed set to 42")
+    line("Using MPS device (Apple Silicon); precision 16-mixed")
+    line("Loading s3://%s-ml-data/%s/v%d/train.parquet  (%s rows)" % (S.org, ds, ri(2, 9), "{:,}".format(ri(200000, 4800000))))
+    line("%s%-24s%s %s" % (B, "Name", R, "Params"))
+    for nm, p in [("encoder", ri(200, 9000)), ("head", ri(20, 400))]:
+        line("%-24s %.1f K" % (nm, p / 10.0))
+    line("Trainable params: %.1f M  |  model: %s" % (random.uniform(0.2, 24), model))
+    tl = _curve(n, random.uniform(0.9, 1.4), random.uniform(0.08, 0.25))
+    vl = [t * random.uniform(1.02, 1.18) for t in tl]
+    acc = [min(0.995, 1 - v * 0.55) for v in vl]
+    fail_at = ri(3, n - 2) if diverge else -1
+    for e in range(n):
+        steps = ri(120, 640)
+        for k in range(0, steps + 1, max(1, steps // 14)):
+            f = k / steps
+            out("\rEpoch %d/%d %s%s%s %d/%d  %sloss=%.3f%s" % (e + 1, n, GREEN, bar(f, 26), R, k, steps, GREY, tl[e] * (1.4 - 0.4 * f), R))
+            nap(0.03, 0.09)
+        if e == fail_at:
+            out("\rEpoch %d/%d %s%s%s %d/%d  %sloss=nan%s\033[K\n" % (e + 1, n, RED, bar(0.4, 26), R, steps // 3, steps, RED, R))
+            line("%sRuntimeError: Function 'MseLossBackward0' returned nan values in its 0th output.%s" % (RED, R))
+            line("%sTrainer was signaled to stop: non-finite loss detected (val_loss=nan)%s" % (RED, R))
+            return fail_at
+        out("\rEpoch %d/%d %s%s%s %d/%d  %sloss=%.3f val_loss=%.3f val_acc=%.4f%s\033[K\n" % (
+            e + 1, n, GREEN, bar(1, 26), R, steps, steps, CYAN, tl[e], vl[e], acc[e], R))
+    line()
+    line("%s%-10s%s %s" % (B, "train loss", R, spark(tl, GREEN)))
+    line("%s%-10s%s %s" % (B, "val loss", R, spark(vl, YELLOW)))
+    line("%s%-10s%s %s" % (B, "val acc", R, spark(acc, CYAN)))
+    best = vl.index(min(vl))
+    line("Best epoch: %d  val_loss=%.4f  val_acc=%.4f  auc=%.4f" % (best + 1, vl[best], acc[best], random.uniform(0.9, 0.985)))
+    line("Saved checkpoint -> artifacts/%s-%s.ckpt (%.1f MB)" % (ds, sha(6), random.uniform(8, 190)))
+    return -1
+
+
+def sc_nvidia():
+    host = "gpu-%02d.%s" % (ri(1, 8), S.domain)
+    type_cmd("ssh %s@%s" % (S.user, host))
+    nap(0.8, 1.5)
+    line("Welcome to Ubuntu 22.04.4 LTS (GNU/Linux 6.5.0-1018-aws x86_64)")
+    S.remote = GREEN + B + "%s@%s" % (S.user, host.split(".")[0]) + R + ":" + BLUE + B + "~" + R + "$ "
+    S.rtitle = "%s@%s" % (S.user, host.split(".")[0])
+    type_cmd("nvidia-smi")
+    ngpu = random.choice([2, 4])
+    name = random.choice(["NVIDIA A100-SXM4-40GB", "NVIDIA A10G", "NVIDIA L4"])
+    mem = {"NVIDIA A100-SXM4-40GB": 40960, "NVIDIA A10G": 23028, "NVIDIA L4": 23034}[name]
+    pwr = {"NVIDIA A100-SXM4-40GB": 400, "NVIDIA A10G": 300, "NVIDIA L4": 72}[name]
+    W = 89
+    line(time.strftime("%a %b %d %H:%M:%S %Y"))
+    line("+" + "-" * W + "+")
+    line("|" + " NVIDIA-SMI 550.54.15              Driver Version: 550.54.15      CUDA Version: 12.4".ljust(W) + "|")
+    line("|" + "-" * 41 + "+" + "-" * 24 + "+" + "-" * 22 + "+")
+    line("| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |")
+    line("| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |")
+    line("|                                         |                        |               MIG M. |")
+    line("|" + "=" * 41 + "+" + "=" * 24 + "+" + "=" * 22 + "|")
+    procs = []
+    for g in range(ngpu):
+        util = ri(0, 100) if random.random() < 0.25 else ri(78, 99)
+        used = int(mem * (0.02 if util < 10 else random.uniform(0.5, 0.95)))
+        col = GREEN if util < 50 else (YELLOW if util < 90 else RED)
+        c1 = ("   %d  %-28s On " % (g, name)).ljust(41)
+        c2 = (" 00000000:%02X:00.0 Off " % (7 + g * 8)).rjust(24)[:24].ljust(24)
+        c3 = (("%d%%" % util).rjust(7) + "      Default ").ljust(22).replace("%d%%" % util, col + "%d%%" % util + R, 1)
+        line("|" + c1 + "|" + c2 + "|" + c3 + "|", 0.03)
+        t = ri(38, 82)
+        c1 = ("  N/A   %dC    P0            %dW / %4dW " % (t, int(pwr * util / 110 + 40), pwr)).ljust(41)
+        c2 = (" %5dMiB / %5dMiB " % (used, mem)).rjust(24)
+        c3 = "             Disabled ".rjust(22)
+        line("|" + c1 + "|" + c2 + "|" + c3 + "|", 0.03)
+        line("+" + "-" * 41 + "+" + "-" * 24 + "+" + "-" * 22 + "+", 0.03)
+        if used > 1000:
+            procs.append((g, ri(2000, 90000), used))
+    line()
+    line("+" + "-" * W + "+")
+    line("|" + " Processes:".ljust(W) + "|")
+    line("|" + ("  GPU   GI   CI        PID   Type   Process name".ljust(W - 11) + "GPU Memory ").ljust(W) + "|")
+    line("|" + ("        ID   ID".ljust(W - 11) + "Usage      ").ljust(W) + "|")
+    line("|" + "=" * W + "|")
+    for g, pid, used in procs:
+        row = "%4d   N/A  N/A %9d      C   %s" % (g, pid, random.choice(["python", "python3.11", "/opt/conda/bin/python"]))
+        line("|" + (row.ljust(W - 11) + ("%dMiB " % used).rjust(11)).ljust(W) + "|", 0.03)
+    line("+" + "-" * W + "+")
+    type_cmd("exit")
+    S.remote = None
+    S.rtitle = None
+    line("logout")
+    line("Connection to %s closed." % host)
+
+
+def sc_notebook():
+    nb = random.choice(["eda", "feature-audit", "cohort-retention", "forecast-backtest"])
+    type_cmd("papermill notebooks/%s.ipynb runs/%s-%s.ipynb -p run_date %s" % (nb, nb, time.strftime("%Y%m%d"), time.strftime("%Y-%m-%d")))
+    cells = ri(16, 34)
+    line("Input Notebook:  notebooks/%s.ipynb" % nb)
+    line("Output Notebook: runs/%s-%s.ipynb" % (nb, time.strftime("%Y%m%d")))
+    t0 = 0.0
+    for c in range(cells + 1):
+        t0 += random.uniform(0.3, 2.2)
+        f = c / cells
+        out("\rExecuting: %3d%%|%s%s| %d/%d [%02d:%02d<%02d:%02d, %.2fs/cell]\033[K" % (
+            f * 100, "█" * int(f * 24), " " * (24 - int(f * 24)), c, cells, t0 // 60, t0 % 60, 0, ri(0, 40), t0 / max(1, c)))
+        nap(0.1, 0.6)
+    out("\n")
+
+
+def sc_pandas():
+    type_cmd("python3")
+    line("Python 3.12.%d (main, %s %d 2026, 14:22:07) [Clang 15.0.0 (clang-1500.3.9.4)] on darwin" % (ri(1, 7), random.choice(["Apr", "Jun", "Aug"]), ri(1, 28)))
+    line('Type "help", "copyright", "credits" or "license" for more information.')
+    S.remote = ">>> "
+    S.rtitle = "Python"
+    rows = ri(200000, 4800000)
+    type_cmd("import pandas as pd")
+    type_cmd('df = pd.read_parquet("data/orders_2026q3.parquet")')
+    nap(0.8, 1.6)
+    type_cmd("df.shape")
+    line("(%d, %d)" % (rows, ri(11, 24)))
+    type_cmd("df[['amount', 'quantity', 'discount']].describe()")
+    cols = ["amount", "quantity", "discount"]
+    stats = ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]
+    data = {"amount": [rows, 84.213, 61.5, 0.99, 38.2, 71.1, 112.9, 2849.0], "quantity": [rows, 2.4, 1.9, 1, 1, 2, 3, 48],
+            "discount": [rows, 0.071, 0.098, 0.0, 0.0, 0.0, 0.1, 0.65]}
+    line("%12s %s" % ("", " ".join(c.rjust(14) for c in cols)))
+    for i, s in enumerate(stats):
+        cells = []
+        for c in cols:
+            v = data[c][i] * (1 if i == 0 else random.uniform(0.96, 1.04))
+            cells.append("%14.6f" % v)
+        line("%-12s %s" % (s, " ".join(cells)), 0.04)
+    type_cmd('df.groupby("region")["amount"].agg(["mean", "sum"]).round(1)')
+    line("%-12s %10s %14s" % ("region", "mean", "sum"))
+    for r in ["us-west", "us-central", "us-east", "emea", "apac"][:ri(3, 5)]:
+        line("%-12s %10.1f %14.1f" % (r, random.uniform(70, 110), random.uniform(1e6, 9e7)), 0.04)
+    type_cmd("df.isna().mean().sort_values(ascending=False).head(3)")
+    for c in random.sample(["coupon_code", "ship_zip", "referrer", "device_id", "promo_id"], 3):
+        line("%-14s %.6f" % (c, random.uniform(0.0001, 0.3)), 0.04)
+    line("dtype: float64")
+    type_cmd("exit()")
+    S.remote = None
+    S.rtitle = None
+
+
+def sc_sklearn():
+    ds = random.choice(DATASETS)
+    type_cmd("python -m eval.report --model models/%s-v%d.pkl --split holdout" % (ds, ri(3, 12)))
+    nap(0.6, 1.4)
+    line("              precision    recall  f1-score   support")
+    line()
+    tot = 0
+    sup = []
+    for cls in ["0", "1", "2"][:random.choice([2, 3])]:
+        p, r = random.uniform(0.78, 0.98), random.uniform(0.7, 0.97)
+        s = ri(2000, 90000)
+        sup.append(s)
+        line("%14s %9.2f %9.2f %9.2f %9d" % (cls, p, r, 2 * p * r / (p + r), s), 0.05)
+    line()
+    line("%14s %29.2f %9d" % ("accuracy", random.uniform(0.85, 0.97), sum(sup)))
+    line("%14s %9.2f %9.2f %9.2f %9d" % ("macro avg", random.uniform(0.8, 0.95), random.uniform(0.8, 0.95), random.uniform(0.8, 0.95), sum(sup)))
+    line()
+    line("%sConfusion matrix%s" % (B, R))
+    tp = ri(800, 9000)
+    mat = [[tp, ri(20, 400)], [ri(20, 600), ri(2000, 40000)]]
+    mx = max(max(r) for r in mat)
+    for r in mat:
+        line("   " + " ".join("%s%8d%s" % (fg(46 if c > mx * 0.3 else 240), c, R) for c in r), 0.05)
+    line("ROC AUC: %.4f   PR AUC: %.4f   logloss: %.4f" % (random.uniform(0.9, 0.985), random.uniform(0.7, 0.95), random.uniform(0.08, 0.3)))
+
+
+# ------------------------------------------------------------ databases
+
+def pg_table(heads, rows, right=()):
+    w = [max([len(h)] + [len(r[i]) for r in rows]) for i, h in enumerate(heads)]
+    line(" " + " | ".join(h.center(w[i]) for i, h in enumerate(heads)), 0.02)
+    line("-" + "-+-".join("-" * x for x in w) + "-", 0.02)
+    for r in rows:
+        line(" " + " | ".join(c.rjust(w[i]) if i in right else c.ljust(w[i]) for i, c in enumerate(r)), 0.04)
+    line("(%d row%s)" % (len(rows), "" if len(rows) == 1 else "s"))
+    line()
+
+
+def pg_connect(ro=True):
+    db = random.choice(["ledger", "orders", "accounts", "analytics"])
+    host = "%s-prod.cluster-%s.%s.rds.amazonaws.com" % (db, rid(12), REGION)
+    type_cmd('psql "postgresql://app_%s@%s:5432/%s"' % ("ro" if ro else "rw", host, db))
+    nap(0.6, 1.2)
+    line("psql (16.%d, server 15.%d)" % (ri(1, 4), ri(4, 7)))
+    line("SSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, compression: off)")
+    line('Type "help" for help.')
+    line()
+    S.remote = "%s=> " % db
+    S.rtitle = "psql"
+    return db
+
+
+def pg_leave():
+    type_cmd("\\q")
+    S.remote = None
+    S.rtitle = None
+
+
+def sc_psql():
+    pg_connect()
+    qs = random.sample([
+        ("SELECT status, count(*) AS n, round(sum(amount_cents)/100.0, 2) AS total FROM invoices WHERE created_at > now() - interval '24 hours' GROUP BY 1 ORDER BY 2 DESC;",
+         lambda: pg_table(["status", "n", "total"], [[s, str(ri(30, 22000)), "%.2f" % random.uniform(900, 1800000)] for s in ["paid", "pending", "failed", "refunded"]], (1, 2))),
+        ("SELECT state, count(*) FROM pg_stat_activity GROUP BY 1 ORDER BY 2 DESC;",
+         lambda: pg_table(["state", "count"], [["active", str(ri(2, 30))], ["idle", str(ri(10, 80))], ["idle in transaction", str(ri(0, 4))]], (1,))),
+        ("SELECT relname, pg_size_pretty(pg_total_relation_size(relid)) AS size FROM pg_catalog.pg_statio_user_tables ORDER BY pg_total_relation_size(relid) DESC LIMIT 5;",
+         lambda: pg_table(["relname", "size"], [[t, "%d %s" % (ri(2, 900), random.choice(["MB", "GB", "MB"]))] for t in random.sample(["ledger_entries", "events", "sessions", "orders", "audit_log", "webhook_deliveries"], 5)], (1,))),
+        ("SELECT count(*) FROM users WHERE last_login_at < now() - interval '90 days';",
+         lambda: pg_table(["count"], [[str(ri(100, 40000))]], (0,))),
+        ("SELECT pid, now() - query_start AS runtime, left(query, 40) AS query FROM pg_stat_activity WHERE state = 'active' ORDER BY 2 DESC LIMIT 3;",
+         lambda: pg_table(["pid", "runtime", "query"], [[str(ri(1000, 30000)), "00:00:%02d.%03d" % (ri(0, 40), ri(0, 999)), q] for q in ["SELECT * FROM orders WHERE customer_id = $1", "UPDATE sessions SET seen_at = now() WHERE", "SELECT sum(amount_cents) FROM invoices WH"]], (0,))),
+    ], ri(2, 3))
+    for q, fn in qs:
+        type_cmd(q)
+        nap(0.4, 1.0)
+        fn()
+    pg_leave()
+
+
+def explain_plan(indexed, rows):
+    t_seq = random.uniform(180, 900)
+    if indexed:
+        ex = random.uniform(0.03, 0.4)
+        line(" Index Scan using idx_orders_customer_created on orders  (cost=0.43..%.2f rows=%d width=96) (actual time=0.0%d..%.3f rows=%d loops=1)" % (random.uniform(8, 60), ri(5, 60), ri(1, 9), ex, ri(5, 60)))
+        line("   Index Cond: ((customer_id = %d) AND (created_at > (now() - '30 days'::interval)))" % ri(1000, 90000))
+        line(" Planning Time: 0.%03d ms" % ri(80, 400))
+        line(" Execution Time: %.3f ms" % ex)
+    else:
+        line(" Gather  (cost=1000.00..%.2f rows=%d width=96) (actual time=%.3f..%.3f rows=%d loops=1)" % (rows * 0.9, ri(5, 60), t_seq * 0.4, t_seq, ri(5, 60)))
+        line("   Workers Planned: 2")
+        line("   Workers Launched: 2")
+        line("   ->  Parallel Seq Scan on orders  (cost=0.00..%.2f rows=%d width=96) (actual time=%.3f..%.3f rows=%d loops=3)" % (rows * 0.8, ri(2, 30), t_seq * 0.5, t_seq * 0.9, ri(2, 30)))
+        line("         Filter: ((customer_id = %d) AND (created_at > (now() - '30 days'::interval)))" % ri(1000, 90000))
+        line("         Rows Removed by Filter: %d" % (rows // 3))
+        line(" Planning Time: 0.%03d ms" % ri(80, 400))
+        line(" Execution Time: %.3f ms" % t_seq)
+    line()
+    return t_seq
+
+
+def sc_redis():
+    host = "cache-prod.%s.0001.usw2.cache.amazonaws.com" % rid(6)
+    type_cmd("redis-cli -h %s -p 6379 --tls" % host)
+    S.remote = "%s:6379> " % host
+    S.rtitle = "redis-cli"
+    mem = random.uniform(300, 3500)
+    cmds = [
+        ("DBSIZE", lambda: line("(integer) %d" % ri(20000, 9000000))),
+        ("INFO memory", lambda: [line(x, 0.03) for x in [
+            "# Memory", "used_memory:%d" % int(mem * 1048576), "used_memory_human:%.2fM" % mem, "used_memory_peak_human:%.2fM" % (mem * 1.12),
+            "maxmemory_human:4.00G", "mem_fragmentation_ratio:1.%02d" % ri(2, 18), "maxmemory_policy:allkeys-lru"]]),
+        ("INFO stats", lambda: [line(x, 0.03) for x in [
+            "# Stats", "total_connections_received:%d" % ri(10000, 900000), "total_commands_processed:%d" % ri(10 ** 7, 9 * 10 ** 8),
+            "instantaneous_ops_per_sec:%d" % ri(300, 18000), "keyspace_hits:%d" % ri(10 ** 7, 9 * 10 ** 8), "keyspace_misses:%d" % ri(10 ** 5, 9 * 10 ** 6),
+            "evicted_keys:%d" % ri(0, 4000), "expired_keys:%d" % ri(10 ** 4, 10 ** 7)]]),
+        ("SLOWLOG GET 2", lambda: [line(x, 0.04) for x in [
+            "1) 1) (integer) %d" % ri(100, 9000), "   2) (integer) %d" % int(time.time()), "   3) (integer) %d" % ri(11000, 90000),
+            '   4) 1) "KEYS"', '      2) "sessions:*"', "2) 1) (integer) %d" % ri(100, 9000), "   2) (integer) %d" % int(time.time() - 40),
+            "   3) (integer) %d" % ri(10500, 40000), '   4) 1) "SMEMBERS"', '      2) "flags:rollout:%s"' % sha(4)]]),
+        ("TTL sessions:%s" % sha(8), lambda: line("(integer) %d" % ri(60, 86000))),
+        ("CLIENT LIST", lambda: [line("id=%d addr=10.%d.%d.%d:%d laddr=10.%d.1.%d:6379 name= age=%d idle=%d flags=N db=0 cmd=get" % (
+            ri(1000, 90000), NET, ri(0, 9), ri(2, 250), ri(30000, 65000), NET, ri(2, 250), ri(10, 9000), ri(0, 30)), 0.06) for _ in range(ri(3, 5))]),
+    ]
+    for c, fn in random.sample(cmds, ri(3, 4)):
+        type_cmd(c)
+        nap(0.2, 0.6)
+        fn()
+    type_cmd("exit")
+    S.remote = None
+    S.rtitle = None
+
+
+# ------------------------------------------------------------- security
+
+SEV = {"CRITICAL": RED + B, "HIGH": ORANGE, "MEDIUM": YELLOW, "LOW": GREY}
+VULN_LIBS = [("libcrypto3", "3.1.4-r5", "3.1.4-r6", "openssl: excessive time spent checking DH keys"),
+             ("zlib", "1.3-r2", "1.3.1-r0", "zlib: heap-based buffer overflow in inflate"),
+             ("busybox", "1.36.1-r15", "1.36.1-r16", "busybox: use-after-free in awk"),
+             ("libexpat", "2.5.0-r2", "2.6.0-r0", "expat: parsing large tokens can trigger denial of service"),
+             ("libcurl", "8.5.0-r0", "8.5.0-r1", "curl: cookie injection with none file"),
+             ("nghttp2-libs", "1.57.0-r0", "1.57.0-r1", "nghttp2: CONTINUATION frames flood"),
+             ("sqlite-libs", "3.44.2-r0", "3.44.2-r1", "sqlite: integer overflow in sessions extension"),
+             ("openssl", "3.1.4-r5", "3.1.4-r6", "openssl: potential DoS via crafted certificate chain")]
+NODE_LIBS = [("semver", "7.5.1", "7.5.2", "semver: Regular Expression Denial of Service"),
+             ("word-wrap", "1.2.3", "1.2.4", "word-wrap: ReDoS in the way it processes whitespace"),
+             ("tar", "6.1.11", "6.2.1", "node-tar: denial of service while parsing a tar file due to lack of folders count validation"),
+             ("braces", "3.0.2", "3.0.3", "braces: uncontrolled resource consumption"),
+             ("ws", "8.13.0", "8.17.1", "ws: DoS when handling a request with many HTTP headers")]
+
+
+def trivy_box(rows):
+    heads = ["Library", "Vulnerability", "Severity", "Status", "Installed Version", "Fixed Version", "Title"]
+    data = [[lib, cve, sev, "fixed", inst, fixed, title] for lib, cve, sev, inst, fixed, title in rows]
+    w = [max([len(h)] + [len(r[i]) for r in data]) + 2 for i, h in enumerate(heads)]
+    room = min(term_w(), 140) - (sum(w[:-1]) + len(w) + 1)  # keep the whole table inside the window
+    w[-1] = max(14, min(w[-1], room))
+    for r in data:
+        r[-1] = r[-1] if len(r[-1]) <= w[-1] - 2 else r[-1][:w[-1] - 3] + "…"
+    line("┌" + "┬".join("─" * x for x in w) + "┐", 0.02)
+    line("│" + "│".join(h.center(w[i]) for i, h in enumerate(heads)) + "│", 0.02)
+    line("├" + "┼".join("─" * x for x in w) + "┤", 0.02)
+    for r in data:
+        cells = []
+        for i, c in enumerate(r):
+            cell = (" " + c).ljust(w[i])
+            cells.append(SEV[c] + cell + R if i == 2 else cell)
+        line("│" + "│".join(cells) + "│", 0.05)
+    line("└" + "┴".join("─" * x for x in w) + "┘", 0.02)
+
+
+def sc_trivy(image=None, findings=None, clean=False):
+    image = image or "%s/%s:%d.%d.%d" % (S.org, S.proj, ri(1, 4), ri(0, 19), ri(0, 9))
+    type_cmd("trivy image --severity HIGH,CRITICAL %s" % image)
+    ts = lambda: time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    for m in ["Vulnerability scanning is enabled", "Secret scanning is enabled", "Detected OS: alpine", "Detecting Alpine vulnerabilities...",
+              "Number of language-specific files: %d" % ri(1, 3)]:
+        line("%s\tINFO\t%s" % (ts(), m), 0.12)
+    line()
+    if clean:
+        line("%s (alpine 3.19.1)" % image)
+        line("=" * (len(image) + 16))
+        line("Total: 0 (HIGH: 0, CRITICAL: 0)")
+        line()
+        return []
+    if findings is None:
+        pool = VULN_LIBS if S.stack != "node" else VULN_LIBS[:4] + NODE_LIBS
+        findings = []
+        for lib, inst, fixed, title in random.sample(pool, ri(2, 5)):
+            findings.append((lib, "CVE-%d-%d" % (ri(2023, 2026), ri(1000, 49999)), random.choice(["HIGH", "HIGH", "CRITICAL"]), inst, fixed, title))
+    crit = sum(1 for f in findings if f[2] == "CRITICAL")
+    line("%s (alpine 3.19.1)" % image)
+    line("=" * (len(image) + 16))
+    line("Total: %d (HIGH: %d, CRITICAL: %d)" % (len(findings), len(findings) - crit, crit))
+    line()
+    trivy_box(findings)
+    return findings
+
+
+def sc_fail2ban(ip=None):
+    type_cmd("sudo tail -n 40 -f /var/log/fail2ban.log")
+    ask("Password:", secret=True, wait=(4.0, 7.0))
+    ips = [ip or "%d.%d.%d.%d" % (random.choice([45, 61, 103, 185, 193, 218]), ri(1, 254), ri(1, 254), ri(1, 254)) for _ in range(1)]
+    bad = ips[0]
+    for _ in range(ri(8, 14)):
+        t = time.strftime("%Y-%m-%d %H:%M:%S,") + "%03d" % ri(0, 999)
+        pid = ri(700, 1200)
+        r = random.random()
+        if r < 0.65:
+            line("%s fail2ban.filter         [%d]: INFO    [sshd] Found %s - %s" % (t, pid, bad, time.strftime("%Y-%m-%d %H:%M:%S")), random.choice([0.1, 0.4, 0.8]))
+        elif r < 0.85:
+            line("%s fail2ban.filter         [%d]: INFO    [nginx-http-auth] Found %d.%d.%d.%d" % (t, pid, ri(40, 200), ri(1, 254), ri(1, 254), ri(1, 254)), 0.2)
+        else:
+            line("%s fail2ban.actions        [%d]: %sNOTICE%s  [sshd] Ban %s" % (t, pid, YELLOW, R, bad), 0.3)
+    out("^C\n")
+    return bad
+
+
+def sc_nikto():
+    host = "staging.%s" % S.domain
+    ip = "%d.%d.%d.%d" % (ri(34, 54), ri(1, 254), ri(1, 254), ri(1, 254))
+    type_cmd("nikto -h https://%s -ssl -Tuning 1,2,3,b" % host)
+    line("- Nikto v2.5.0")
+    line("---------------------------------------------------------------------------")
+    line("+ Target IP:          %s" % ip)
+    line("+ Target Hostname:    %s" % host)
+    line("+ Target Port:        443")
+    line("---------------------------------------------------------------------------")
+    line("+ SSL Info:        Subject:  /CN=%s" % host)
+    line("                   Ciphers:  TLS_AES_256_GCM_SHA384")
+    line("                   Issuer:   /C=US/O=Let's Encrypt/CN=R%d" % ri(10, 11))
+    line("+ Start Time:         %s (GMT-7)" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    line("---------------------------------------------------------------------------")
+    line("+ Server: nginx/1.25.%d" % ri(0, 5))
+    items = ["+ /: The anti-clickjacking X-Frame-Options header is not present. See: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Frame-Options",
+             "+ /: The X-Content-Type-Options header is not set. This could allow the user agent to render the content of the site in a different fashion to the MIME type.",
+             "+ No CGI Directories found (use '-C all' to force check all possible dirs)",
+             "+ /robots.txt: contains %d entries which should be manually viewed." % ri(2, 9),
+             "+ OPTIONS: Allowed HTTP Methods: GET, HEAD, POST, OPTIONS .",
+             "+ /login: Cookie session created without the secure flag set."]
+    for it in random.sample(items, ri(3, 5)):
+        nap(0.5, 1.8)
+        line(it)
+    n = ri(3000, 9000)
+    nap(0.8, 1.5)
+    line("+ %d requests: 0 error(s) and %d item(s) reported on remote host" % (n, ri(3, 7)))
+    line("+ End Time:           %s (GMT-7) (%d seconds)" % (time.strftime("%Y-%m-%d %H:%M:%S"), ri(40, 260)))
+    line("---------------------------------------------------------------------------")
+    line("+ 1 host(s) tested")
+
+
+def sc_audit():
+    if S.stack == "node":
+        type_cmd("npm audit")
+        pkgs = random.sample(NODE_LIBS, ri(2, 4))
+        line("# npm audit report")
+        for lib, inst, fixed, title in pkgs:
+            sev = random.choice(["high", "moderate", "critical"])
+            line()
+            line("%s  <%s" % (lib, fixed))
+            line("Severity: %s%s%s" % (RED if sev != "moderate" else YELLOW, sev, R))
+            line("%s - https://github.com/advisories/GHSA-%s-%s-%s" % (title, "".join(random.choices("23456789cfghjmpqrvwx", k=4)), "".join(random.choices("23456789cfghjmpqrvwx", k=4)), "".join(random.choices("23456789cfghjmpqrvwx", k=4))))
+            line("fix available via `npm audit fix`")
+            line("node_modules/%s" % lib)
+        line()
+        line("%d vulnerabilities (%d moderate, %d high)" % (len(pkgs), len(pkgs) // 2, len(pkgs) - len(pkgs) // 2))
+        line()
+        line("To address all issues, run:")
+        line("  npm audit fix")
+    else:
+        type_cmd("pip-audit -r requirements.txt")
+        line("Found %d known vulnerabilities in %d packages" % (ri(2, 4), ri(2, 3)))
+        rows = [["urllib3", "2.0.%d" % ri(2, 6), "GHSA-%s-%s" % (rid(4), rid(4)), "2.2.2"], ["cryptography", "42.0.%d" % ri(0, 4), "PYSEC-2024-%d" % ri(100, 260), "42.0.8"],
+                ["jinja2", "3.1.%d" % ri(2, 3), "CVE-2024-%d" % ri(20000, 40000), "3.1.5"], ["requests", "2.31.0", "CVE-2024-35195", "2.32.0"]]
+        rows = random.sample(rows, ri(2, 4))
+        w = [max([len(h)] + [len(r[i]) for r in rows]) for i, h in enumerate(["Name", "Version", "ID", "Fix Versions"])]
+        heads = ["Name", "Version", "ID", "Fix Versions"]
+        line(" ".join(h.ljust(w[i]) for i, h in enumerate(heads)))
+        line(" ".join("-" * x for x in w))
+        for r in rows:
+            line(" ".join(c.ljust(w[i]) for i, c in enumerate(r)), 0.06)
+
+
+# ---------------------------------------------------- cloud / M365 admin
+
+def c_mailbox():
+    f, l, s = person()
+    type_cmd("Get-Mailbox -Identity %s@%s | Select DisplayName,PrimarySmtpAddress,ProhibitSendQuota,ArchiveStatus" % (s, S.domain))
+    nap(0.6, 1.2)
+    ps_table(["DisplayName", "PrimarySmtpAddress", "ProhibitSendQuota", "ArchiveStatus"],
+             [["%s %s" % (f, l), "%s@%s" % (s, S.domain), "99 GB (106,300,440,064 bytes)", random.choice(["Active", "None"])]])
+
+
+def c_msgtrace():
+    type_cmd("Get-MessageTrace -SenderAddress billing@%s -StartDate (Get-Date).AddHours(-6) -EndDate (Get-Date) | Select Received,RecipientAddress,Status" % S.domain)
+    nap(0.9, 1.8)
+    ps_table(["Received", "RecipientAddress", "Status"],
+             [[when(0), "%s@%s" % (person()[2], random.choice([S.domain, "gmail.com", "outlook.com", "northwind.dev"])), random.choice(["Delivered", "Delivered", "Delivered", "Pending", "FilteredAsSpam"])] for _ in range(ri(4, 7))])
+
+
+def c_mguser():
+    f, l, s = person()
+    type_cmd("Get-MgUser -UserId %s@%s -Property DisplayName,AccountEnabled,SignInActivity | Format-List" % (s, S.domain))
+    nap(0.6, 1.2)
+    ps_list([("DisplayName", "%s %s" % (f, l)), ("AccountEnabled", "True"), ("Id", "%s-%s-%s-%s-%s" % (sha(8), sha(4), sha(4), sha(4), sha(12))),
+             ("SignInActivity", "Microsoft.Graph.PowerShell.Models.MicrosoftGraphSignInActivity")], 16)
+    line()
+
+
+def c_signins():
+    type_cmd("Get-MgAuditLogSignIn -Top 6 -Filter \"conditionalAccessStatus eq 'failure'\" | Select CreatedDateTime,UserPrincipalName,AppDisplayName,IPAddress")
+    nap(1, 2)
+    ps_table(["CreatedDateTime", "UserPrincipalName", "AppDisplayName", "IPAddress"],
+             [[when(0), "%s@%s" % (person()[2], S.domain), random.choice(["Office 365 Exchange Online", "Microsoft Teams", "Azure Portal", "SharePoint Online"]),
+               "%d.%d.%d.%d" % (random.choice([73, 98, 174, 104]), ri(1, 254), ri(1, 254), ri(1, 254))] for _ in range(ri(4, 6))])
+
+
+def c_intune():
+    type_cmd("Get-MgDeviceManagementManagedDevice -Filter \"complianceState eq 'noncompliant'\" | Select DeviceName,OperatingSystem,UserPrincipalName,LastSyncDateTime")
+    nap(1, 2)
+    ps_table(["DeviceName", "OperatingSystem", "UserPrincipalName", "LastSyncDateTime"],
+             [["%s-%s" % (random.choice(["LT", "WS", "MBP"]), "".join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=7))), random.choice(["Windows", "macOS", "iOS"]),
+               "%s@%s" % (person()[2], S.domain), when(ri(0, 12))] for _ in range(ri(3, 6))])
+
+
+def c_license():
+    type_cmd("Get-MgSubscribedSku | Select SkuPartNumber,ConsumedUnits,@{n='Total';e={$_.PrepaidUnits.Enabled}}")
+    nap(0.8, 1.5)
+    ps_table(["SkuPartNumber", "ConsumedUnits", "Total"],
+             [[sku, str(ri(40, 420)), str(ri(450, 500))] for sku in ["SPE_E3", "EMS", "POWER_BI_PRO", "VISIOCLIENT", "PROJECTPREMIUM"][:ri(3, 5)]])
+
+
+def c_sccm():
+    type_cmd("Get-CMDeploymentStatus -CollectionName 'All Workstations' | Select SoftwareName,NumberSuccess,NumberErrors,NumberInProgress")
+    nap(1, 2)
+    ps_table(["SoftwareName", "NumberSuccess", "NumberErrors", "NumberInProgress"],
+             [[n, str(ri(300, 900)), str(ri(0, 14)), str(ri(0, 80))] for n in ["Microsoft Edge 130.0", "Zoom Workplace 6.2", "CrowdStrike Sensor 7.19", "Adobe Acrobat 24.004"][:ri(2, 4)]])
+
+
+CLOUD_CMDS = [c_mailbox, c_msgtrace, c_mguser, c_signins, c_intune, c_license, c_sccm]
+
+
+def sc_cloudadmin():
+    mod = random.choice([("Connect-ExchangeOnline -UserPrincipalName admin@%s -ShowBanner:$false", None),
+                         ("Connect-MgGraph -Scopes 'User.Read.All','AuditLog.Read.All','DeviceManagementManagedDevices.Read.All'", "Welcome to Microsoft Graph!")])
+    type_cmd("pwsh")
+    line("PowerShell 7.4.%d" % ri(1, 6))
+    S.remote = "PS /Users/%s> " % S.user
+    S.rtitle = "pwsh"
+    type_cmd(mod[0] % S.domain if "%s" in mod[0] else mod[0])
+    nap(1.5, 3)
+    if mod[1]:
+        line(mod[1])
+        line()
+        line("Welcome To Microsoft Graph!")
+        line()
+    for fn in random.sample(CLOUD_CMDS, ri(2, 4)):
+        nap(0.5, 1.4)
+        fn()
+    type_cmd("exit")
+    S.remote = None
+    S.rtitle = None
+
+
+# ------------------------------------------------------------ build noise
+
+def sc_make():
+    names = ["parser", "lexer", "codegen", "scheduler", "net_io", "allocator", "tls_shim", "ringbuf", "tokenizer", "metrics"]
+    random.shuffle(names)
+    type_cmd("cmake --build build -j%d" % (os.cpu_count() or 8))
+    line("[  0%%] Built target %s_deps" % S.proj.split("-")[0])
+    n = ri(6, len(names))
+    for i, nm in enumerate(names[:n]):
+        p = int((i + 1) / (n + 2) * 100)
+        line("[%3d%%] %sBuilding CXX object src/CMakeFiles/%s.dir/%s.cpp.o%s" % (p, GREEN, S.proj.split("-")[0], nm, R), random.choice([0.08, 0.2, 0.6, 1.2]))
+        if random.random() < 0.3:
+            ln = ri(20, 400)
+            line("/Users/%s/work/%s/src/%s.cpp:%d:%d: %swarning:%s %s" % (S.user, S.proj, nm, ln, ri(5, 30), YELLOW + B, R + B, random.choice(
+                ["unused variable 'tmp' [-Wunused-variable]", "comparison of integers of different signs: 'int' and 'size_t' [-Wsign-compare]",
+                 "implicit conversion loses integer precision: 'size_t' to 'int' [-Wshorten-64-to-32]"]) + R), 0.05)
+            line("%5d |     int tmp = 0;" % ln, 0.03)
+            line("      |         %s^~~%s" % (GREEN, R), 0.03)
+            line("1 warning generated.", 0.05)
+    line("[ 98%%] %sLinking CXX executable %s%s" % (B, S.proj.split("-")[0], R), 0.8)
+    line("[100%%] Built target %s" % S.proj.split("-")[0])
+
+
+def sc_xcodebuild():
+    app = random.choice(["Kestrel", "Meridian", "Atlas", "Beacon"])
+    type_cmd("xcodebuild -scheme %s -configuration Release -destination 'platform=macOS' build | xcbeautify" % app)
+    line("%sxcbeautify%s version 1.4.0" % (GREY, R))
+    line("Build settings from command line:")
+    line("    SDKROOT = macosx%s" % (platform.mac_ver()[0] or "15.1")[:4])
+    for t in ["Resolve Package Graph", "Compiling Swift source files"]:
+        line("▸ %s" % t, 0.3)
+    srcs = ["AppDelegate", "SessionStore", "SyncEngine", "KeychainBridge", "NetworkClient", "OnboardingView", "SettingsView", "Telemetry", "CrashReporter", "PreferencesModel"]
+    random.shuffle(srcs)
+    for sname in srcs[:ri(6, 10)]:
+        line("%s▸%s Compiling %s%s.swift%s" % (GREY, R, B, sname, R), random.choice([0.06, 0.2, 0.5]))
+        if random.random() < 0.15:
+            line("%s⚠%s %s.swift:%d:%d: %svariable 'result' was never mutated; consider changing to 'let' constant%s" % (YELLOW, R, sname, ri(10, 200), ri(5, 30), YELLOW, R))
+    line("▸ Linking %s" % app, 0.6)
+    line("▸ Generating dSYM file", 0.5)
+    line("▸ Signing %s.app (identity: Apple Development: %s)" % (app, S.user), 0.5)
+    line("%s▸ Build Succeeded%s" % (GREEN + B, R))
+
+
+def sc_git_graph():
+    type_cmd("git log --graph --oneline --decorate --all -n 14")
+    lines = []
+    first = True
+    n = 0
+    while n < 13:
+        if random.random() < 0.45 and n < 9:
+            lines.append(("*   ", "Merge pull request #%d from %s/%s" % (ri(300, 900), S.org, random.choice(BRANCHES[3:] or ["feature/x"]))))
+            lines.append(("|\\  ", None))
+            for _ in range(ri(1, 3)):
+                lines.append(("| * ", commit_msg()))
+                n += 1
+            lines.append(("|/  ", None))
+            n += 1
+        else:
+            lines.append(("* ", commit_msg()))
+            n += 1
+    for i, (g, msg) in enumerate(lines):
+        if msg is None:
+            line("%s%s%s" % (RED, g, R), 0.03)
+            continue
+        dec = ""
+        if first:
+            dec = " %s(%sHEAD -> %s%s%s, %s%s%s)%s" % (YELLOW, CYAN, GREEN, S.branch, YELLOW, RED, "origin/" + S.branch, YELLOW, R)
+            first = False
+        line("%s%s%s%s%s%s %s" % (RED, g, R, YELLOW, sha(), R + dec, msg), 0.05)
+
+
+# ----------------------------------------------------------------- pagers
+
+def _pager_screen(rows, body, status):
+    h = term_h()
+    out("\033[H")
+    for i in range(h - 1):
+        out((body[i] if i < len(body) else "~") + "\033[K" + ("\n" if i < h - 2 else ""))
+    out("\033[%d;1H%s%s%s\033[K" % (h, INV, status, R))
+
+
+MAN_PAGES = {
+    "rsync": ("RSYNC(1)", "General Commands Manual", [
+        ("NAME", ["rsync -- a fast, versatile, remote (and local) file-copying tool"]),
+        ("SYNOPSIS", ["rsync [OPTION...] SRC... [DEST]", "rsync [OPTION...] SRC... [USER@]HOST:DEST", "rsync [OPTION...] [USER@]HOST:SRC... [DEST]"]),
+        ("DESCRIPTION", ["Rsync is a program that behaves in much the same way that rcp does, but has many more", "options and uses the rsync remote-update protocol to greatly speed up file transfers when",
+                         "the destination file is being updated.", "", "The rsync remote-update protocol allows rsync to transfer just the differences between two sets",
+                         "of files across the network connection, using an efficient checksum-search algorithm."]),
+        ("OPTIONS", ["-v, --verbose        increase verbosity", "-a, --archive        archive mode; equals -rlptgoD (no -H,-A,-X)", "-z, --compress       compress file data during the transfer",
+                     "-n, --dry-run        perform a trial run with no changes made", "    --delete          delete extraneous files from destination dirs",
+                     "-P                   same as --partial --progress", "-e, --rsh=COMMAND   specify the remote shell to use", "    --exclude=PATTERN exclude files matching PATTERN",
+                     "-h, --human-readable output numbers in a human-readable format", "    --bwlimit=RATE    limit socket I/O bandwidth"]),
+    ]),
+    "curl": ("CURL(1)", "curl Manual", [
+        ("NAME", ["curl - transfer a URL"]),
+        ("SYNOPSIS", ["curl [options / URLs]"]),
+        ("DESCRIPTION", ["curl is a tool for transferring data from or to a server using URLs. It supports these", "protocols: DICT, FILE, FTP, FTPS, GOPHER, GOPHERS, HTTP, HTTPS, IMAP, IMAPS, LDAP, LDAPS,",
+                         "MQTT, POP3, POP3S, RTMP, RTMPS, RTSP, SCP, SFTP, SMB, SMBS, SMTP, SMTPS, TELNET, TFTP, WS and WSS."]),
+        ("OPTIONS", ["-s, --silent         Silent or quiet mode. Do not show progress meter or error messages.", "-S, --show-error     When used with -s, make curl show an error message if it fails.",
+                     "-L, --location       Follow redirects.", "-H, --header <header> Extra header to include in information sent.", "-X, --request <method> Specify request method to use.",
+                     "-d, --data <data>    Sends the specified data in a POST request to the HTTP server.", "-o, --output <file> Write output to <file> instead of stdout.",
+                     "-I, --head           Fetch the headers only!", "    --retry <num>    If a transient error is returned when curl tries to perform a transfer, it will retry this number of times."]),
+    ]),
+    "ssh": ("SSH(1)", "General Commands Manual", [
+        ("NAME", ["ssh -- OpenSSH remote login client"]),
+        ("SYNOPSIS", ["ssh [-46AaCfGgKkMNnqsTtVvXxYy] [-B bind_interface] [-b bind_address] [-c cipher_spec]", "    [-D [bind_address:]port] [-E log_file] [-F configfile] [-I pkcs11] [-i identity_file]",
+                      "    [-J destination] [-L address] [-l login_name] [-o option] [-p port] destination [command]"]),
+        ("DESCRIPTION", ["ssh (SSH client) is a program for logging into a remote machine and for executing commands", "on a remote machine. It is intended to provide secure encrypted communications between two",
+                         "untrusted hosts over an insecure network. X11 connections, arbitrary TCP ports and UNIX-domain", "sockets can also be forwarded over the secure channel."]),
+        ("OPTIONS", ["-A    Enables forwarding of connections from an authentication agent such as ssh-agent(1).", "-J destination", "    Connect to the target host by first making an ssh connection to the jump host.",
+                     "-L [bind_address:]port:host:hostport", "    Specifies that connections to the given TCP port or Unix socket on the local host are to be forwarded.",
+                     "-N    Do not execute a remote command. This is useful for just forwarding ports.", "-v    Verbose mode."]),
+    ]),
+}
+
+
+def sc_man():
+    nm = random.choice(list(MAN_PAGES))
+    head, sub, secs = MAN_PAGES[nm]
+    type_cmd("man %s" % nm)
+    body = ["%s%s%s%s%s" % (B, head, " " * max(1, 40 - len(head)), sub, R), ""]
+    for t, ls in secs:
+        body.append(B + t + R)
+        for l in ls:
+            body.append("     " + l)
+        body.append("")
+    h = term_h()
+    _alt_on_cursor()
+    top = 0
+    while True:
+        _pager_screen(h, body[top:top + h - 1], ":")
+        nap(2.0, 4.5)
+        if top + h - 1 >= len(body):
+            break
+        top += max(1, h - 2)
+    out("\033[%d;1H\033[K:" % h)
+    type_text("q", base=0.3)
+    nap(0.3)
+    _alt_off()
+
+
+def _alt_on_cursor():
+    out("\033[?1049h\033[2J\033[H")
+    S.alt = True
+
+
+def sc_less():
+    svc = random.choice(SERVICES)
+    path = "/var/log/%s/%s.log" % (S.proj, svc)
+    type_cmd("less %s" % path)
+    h = term_h()
+    msgs = ["request completed method=GET path=/v2/orders status=200", "cache hit key=flags:%s", "retrying request backoff=%dms",
+            "pool stats active=%d idle=%d", "slow query detected table=ledger_entries", "upstream timed out after 3000ms service=inventory",
+            "batch flushed records=%d", "token refreshed user=%s"]
+    lv = {"INFO": GREEN, "WARN": YELLOW, "ERROR": RED}
+    page = []
+    for _ in range(h - 1):
+        l = random.choices(["INFO", "WARN", "ERROR"], [8, 2, 1])[0]
+        m = random.choice(msgs)
+        m = m % (sha(6),) if "%s" in m else (m % (ri(1, 20), ri(0, 20)) if m.count("%d") == 2 else (m % ri(2, 900) if "%d" in m else m))
+        page.append((l, "%s %-5s [%s-%d] %s" % (now_utc(), l, svc, ri(1, 12), m)))
+    _alt_on_cursor()
+    for scroll in range(ri(2, 3)):
+        buf = []
+        for l, t in page:
+            buf.append(t[:term_w()])
+        _pager_screen(h, buf, path)
+        nap(1.5, 3)
+        page = [(l, t) for l, t in page]
+        for _ in range(h - 2):
+            l = random.choices(["INFO", "WARN", "ERROR"], [8, 2, 1])[0]
+            m = random.choice(msgs)
+            m = m % (sha(6),) if "%s" in m else (m % (ri(1, 20), ri(0, 20)) if m.count("%d") == 2 else (m % ri(2, 900) if "%d" in m else m))
+            page.append((l, "%s %-5s [%s-%d] %s" % (now_utc(), l, svc, ri(1, 12), m)))
+        page = page[-(h - 1):]
+    out("\033[%d;1H\033[K/" % h)
+    type_text("ERROR", base=0.15)
+    nap(0.4)
+    buf = []
+    for l, t in page:
+        t = t[:term_w()]
+        buf.append(t.replace("ERROR", INV + "ERROR" + R) if "ERROR" in t else t)
+    _pager_screen(h, buf, path)
+    nap(2.5, 4)
+    out("\033[%d;1H\033[K:" % h)
+    type_text("q", base=0.3)
+    nap(0.3)
+    _alt_off()
+
+
+def _cut(s, w):
+    return s[:w].ljust(w)
+
+
+def sc_tmux():
+    type_cmd("tmux new -s %s" % random.choice(["work", "dev", "ops", S.proj.split("-")[0]]))
+    nap(0.4)
+    w, h = term_w(), term_h()
+    lw = w // 2
+    rw = w - lw - 1
+    th = (h - 1) // 2
+    bh = h - 1 - th - 1
+    _alt_on_cursor()
+    out("\033[?25l")
+    logs = []
+    svc = random.choice(SERVICES)
+    cpu = [random.uniform(10, 70) for _ in range(4)]
+    pods = ["%s-%s" % (s, sha(5)) for s in random.sample(SERVICES, min(len(SERVICES), max(2, bh - 2)))]
+    age = [ri(1, 600) for _ in pods]
+    for f in range(ri(40, 70)):
+        w2, h2 = term_w(), term_h()
+        if (w2, h2) != (w, h):  # window resized mid-scene: recompute the layout
+            w, h = w2, h2
+            lw = w // 2
+            rw = w - lw - 1
+            th = (h - 1) // 2
+            bh = h - 1 - th - 1
+            out("\033[2J")
+        buf = []
+        if f % 2 == 0:
+            lvl = random.choices(["INFO", "WARN", "ERROR"], [8, 2, 1])[0]
+            logs.append((lvl, "%s %-5s %s-%d request completed status=%d duration=%dms" % (time.strftime("%H:%M:%S"), lvl, svc, ri(1, 9), random.choice([200, 200, 200, 201, 404, 500]), ri(3, 900))))
+            logs = logs[-(h - 2):]
+        col = {"INFO": "", "WARN": YELLOW, "ERROR": RED}
+        for r in range(h - 1):
+            lt = logs[r - ((h - 1) - len(logs))] if r >= (h - 1) - len(logs) else None
+            buf.append("\033[%d;1H%s%s%s" % (r + 1, col[lt[0]] if lt else "", _cut(lt[1] if lt else "", lw), R))
+        for r in range(h - 1):
+            buf.append("\033[%d;%dH%s│%s" % (r + 1, lw + 1, GREY, R))
+        cpu = [max(2, min(99, c + random.uniform(-14, 14))) for c in cpu]
+        for i, c in enumerate(cpu[:max(1, th - 1)]):
+            n = int(c / 100 * (rw - 18))
+            buf.append("\033[%d;%dH%s %d [%s%s%s%s] %4.1f%%%s" % (i + 1, lw + 2, "", i, heat(c / 100), "|" * n, GREY, " " * (rw - 18 - n), c, R))
+        buf.append("\033[%d;%dH%s%s%s" % (th + 1, lw + 2, GREY, "─" * (rw - 1), R))
+        buf.append("\033[%d;%dH%s%s%s" % (th + 2, lw + 2, B, _cut("NAME                 READY  STATUS    AGE", rw - 1), R))
+        for i, p in enumerate(pods[:bh - 1]):
+            buf.append("\033[%d;%dH%s%s%s" % (th + 3 + i, lw + 2, "", _cut("%-20s 1/1    Running   %ds" % (p, age[i] + f * 2), rw - 1), R))
+        buf.append("\033[%d;1H%s%s%s" % (h, "\033[30;42m", _cut(" [%s] 0:zsh  1:logs*  2:vim-%s\"%s\" %s %s" % ("0", " " * 4, S.host, time.strftime("%H:%M"), time.strftime("%d-%b-%y")), w), R))
+        out("".join(buf))
+        nap(0.18, 0.4)
+    nap(1)
+    _alt_off()
+
+
+# --------------------------------------------------------------- story arcs
+# An arc is a little narrative: each step is a queued scene that carries on
+# from the previous one (same service, same file, same error).
+
+def _kubectl_pods(svc, ns, bad):
+    type_cmd("kubectl get pods -n %s -l app=%s" % (ns, svc))
+    line("%-44s %-7s %-18s %-9s %s" % ("NAME", "READY", "STATUS", "RESTARTS", "AGE"), 0.03)
+    for i in range(3):
+        p = "%s-%s-%s" % (svc, sha(9), "".join(random.choices("bcdfghjklmnpqrstvwxz2456789", k=5)))
+        if bad and i == 0:
+            line("%s%-44s %-7s %-18s %-9s %s%s" % (RED, p, "0/1", "CrashLoopBackOff", "%d (1m ago)" % ri(4, 9), "%dm" % ri(8, 40), R), 0.05)
+        else:
+            line("%-44s %-7s %s%-18s%s %-9s %s" % (p, "1/1", GREEN, "Running", R, "0" if not bad else ri(0, 1), "%dm" % ri(1, 59) if not bad else "%dd%dh" % (ri(0, 9), ri(0, 23))), 0.05)
+
+
+CAUSES = [
+    ("pool", "ERROR failed to acquire database connection: timeout after 5000ms (pool exhausted: 20/20 in use)", "connection pool", "fix(db): release connection on early return in %s"),
+    ("nil", "FATAL panic: runtime error: invalid memory address or nil pointer dereference", "nil deref", "fix(%s): guard nil session before token refresh"),
+    ("oom", "ERROR container exceeded memory limit (512Mi) - OOMKilled (exit code 137)", "memory limit", "fix(%s): stream batch instead of loading all rows"),
+    ("cfg", "ERROR config key `queue.brokers` is required but not set", "config", "fix(%s): default queue.brokers from env"),
+]
+
+
+def _commit_push(msg):
+    type_cmd('git commit -am "%s"' % msg)
+    line("[%s %s] %s" % (S.branch, sha(), msg))
+    line(" %d files changed, %d insertions(+), %d deletions(-)" % (ri(1, 3), ri(2, 40), ri(1, 15)))
+    S.dirty = False
+    type_cmd("git push origin %s" % S.branch)
+    n = ri(5, 12)
+    pct("Counting objects", n)
+    pct("Writing objects", n - 2, ", %d.%d KiB | %d.%d MiB/s" % (ri(1, 9), ri(10, 99), ri(1, 9), ri(10, 99)))
+    line("To github.com:%s/%s.git" % (S.org, S.proj))
+    line("   %s..%s  %s -> %s" % (sha(), sha(), S.branch, S.branch))
+
+
+def arc_incident():
+    svc = random.choice(SERVICES)
+    ns = "production"
+    key, err, what, msg = random.choice(CAUSES)
+    f = random.choice([x for x in S.files if not x.endswith((".json", ".toml", "go.mod", ".yaml", ".yml", ".tf"))] or S.files)
+
+    def logs():
+        type_cmd("kubectl logs deploy/%s -n %s --previous --tail=8" % (svc, ns))
+        for m in ["INFO  starting %s v1.%d.%d" % (svc, ri(2, 9), ri(0, 9)), "INFO  loading config from /etc/config/app.yaml", "WARN  feature flag service slow (%dms)" % ri(1500, 3000), err, "FATAL exiting with code 1"]:
+            line("%s %s" % (now_utc(), m), 0.12)
+
+    def find():
+        word = {"pool": "pool.acquire", "nil": "session.", "oom": "fetchAll", "cfg": "queue.brokers"}[key]
+        type_cmd('grep -rn "%s" . --include="*" -l | head -5' % word)
+        for x in random.sample(S.files, min(3, len(S.files))):
+            line("./%s" % x, 0.05)
+        line("./%s" % f)
+
+    def roll():
+        type_cmd("kubectl rollout status deploy/%s -n %s" % (svc, ns))
+        for i in range(1, 4):
+            nap(0.8, 1.6)
+            line('Waiting for deployment "%s" rollout to finish: %d out of 3 new replicas have been updated...' % (svc, i))
+        nap(1)
+        line('deployment "%s" successfully rolled out' % svc)
+
+    def health():
+        type_cmd("curl -s https://api.%s/healthz | jq" % S.domain)
+        line("{")
+        line('  "status": "ok",')
+        line('  "version": "1.%d.%d",' % (ri(2, 9), ri(0, 9)))
+        line('  "db": "up", "cache": "up", "queue": "up"')
+        line("}")
+
+    return [lambda: _kubectl_pods(svc, ns, True), logs, find, lambda: sc_editor(f), lambda: _commit_push(msg % svc if "%s" in msg else msg),
+            sc_gh_run, roll, lambda: _kubectl_pods(svc, ns, False), health]
+
+
+def arc_red_tests():
+    runner = {"python": sc_pytest, "data": sc_pytest, "sec": sc_pytest, "node": sc_jest, "rust": sc_cargo}.get(S.stack)
+    if runner is None:
+        return arc_incident()
+    msg = random.choice(["fix: stop mutating shared fixture in tests", "fix: handle null session in token refresh", "fix: correct off-by-one in pagination", "fix: await teardown before asserting"])
+    return [lambda: runner(fail=True), lambda: _commit_push(msg), sc_gh_run]
+
+
+def arc_vuln():
+    image = "%s/%s:%d.%d.%d" % (S.org, S.proj, ri(1, 4), ri(0, 19), ri(0, 9))
+    pool = NODE_LIBS if S.stack == "node" else VULN_LIBS
+    lib, inst, fixed, title = random.choice(pool)
+    fnd = [(lib, "CVE-%d-%d" % (ri(2024, 2026), ri(1000, 49999)), "CRITICAL", inst, fixed, title)]
+    ffile = "package.json" if S.stack == "node" else ("Dockerfile" if S.stack != "python" else "requirements.txt")
+
+    def bump():
+        type_cmd("grep -n \"%s\" %s" % (lib, ffile))
+        line("%s%d:%s  \"%s\": \"^%s\"" % (GREEN, ri(10, 40), R, lib, inst))
+        sc_editor(ffile)
+
+    return [lambda: sc_trivy(image, fnd), bump, sc_docker_build, lambda: sc_trivy(image, clean=True), lambda: _commit_push("chore(deps): bump %s to %s (%s)" % (lib, fixed, fnd[0][1]))]
+
+
+def arc_lockout():
+    f, l, s = person()
+    dc = random.choice(["DC01", "DC02"])
+    fqdn = "%s.%s" % (dc.lower(), ad_domain())
+    src = "WS-%s" % "".join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=6))
+
+    def enter():
+        type_cmd("Enter-PSSession -ComputerName %s -Credential CORP\\svc-admin" % fqdn)
+        line("PowerShell credential request")
+        ask("Password for user CORP\\svc-admin: ", secret=True, wait=(4.0, 7.0))
+        S.remote = "[%s]: PS C:\\Users\\svc-admin\\Documents> " % fqdn
+        S.rtitle = "pwsh"
+
+    def lookup():
+        type_cmd("Get-ADUser -Identity %s -Properties LockedOut,BadLogonCount,LastBadPasswordAttempt,PasswordLastSet | Format-List" % s)
+        nap(0.8, 1.4)
+        ps_list([("BadLogonCount", str(ri(5, 12))), ("DistinguishedName", "CN=%s %s,OU=Users,OU=HQ,%s" % (f, l, dn_base())), ("LastBadPasswordAttempt", when(0)),
+                 ("LockedOut", RED + "True" + R), ("PasswordLastSet", when(ri(60, 120))), ("SamAccountName", s)], 22)
+        line()
+
+    def source():
+        type_cmd("Get-WinEvent -FilterHashtable @{LogName='Security';Id=4740} -MaxEvents 3 | Where-Object { $_.Message -match '%s' } | Select TimeCreated,Message" % s)
+        nap(1, 1.8)
+        ps_table(["TimeCreated", "Message"], [[when(0), "A user account was locked out. Caller Computer Name: %s" % src] for _ in range(2)])
+
+    def unlock():
+        type_cmd("Unlock-ADAccount -Identity %s" % s)
+        nap(0.6, 1.2)
+        type_cmd("Get-ADUser %s -Properties LockedOut | Select-Object SamAccountName,LockedOut" % s)
+        ps_table(["SamAccountName", "LockedOut"], [[s, "False"]])
+
+    def leave():
+        type_cmd("Exit-PSSession")
+        S.remote = None
+        S.rtitle = None
+        type_cmd("ping -c 3 %s.%s" % (src.lower(), ad_domain()))
+        ip = pip4(ri(10, 40))
+        line("PING %s.%s (%s): 56 data bytes" % (src.lower(), ad_domain(), ip))
+        for i in range(3):
+            line("64 bytes from %s: icmp_seq=%d ttl=127 time=%.3f ms" % (ip, i, random.uniform(0.8, 6)), 0.5)
+
+    return [enter, lookup, source, unlock, leave]
+
+
+def arc_dns():
+    host = random.choice(["app", "vpn", "sso", "intranet", "files"]) + "." + S.domain
+    dc = "10.%d.4.10" % NET
+    ip = "%d.%d.%d.%d" % (ri(34, 54), ri(1, 254), ri(1, 254), ri(1, 254))
+
+    def bad():
+        type_cmd("dig %s" % host)
+        _dig_head(host, "SERVFAIL", 0)
+        line()
+        line(";; QUESTION SECTION:")
+        line(";%s.\t\tIN\tA" % host)
+        _dig_foot("192.168.1.1")
+
+    def good():
+        type_cmd("dig @%s %s +short" % (dc, host))
+        nap(0.4)
+        line(ip)
+
+    def flush():
+        type_cmd("sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder")
+        ask("Password:", secret=True, wait=(4.0, 7.0))
+
+    def again():
+        type_cmd("dig %s +short" % host)
+        nap(0.3)
+        line(ip)
+        type_cmd("curl -sI https://%s | head -1" % host)
+        line("HTTP/2 200")
+
+    return [bad, good, flush, again]
+
+
+def arc_diverge():
+    ds = random.choice(DATASETS)
+
+    def first():
+        return sc_train(True, ds)
+
+    def tweak():
+        type_cmd("grep -n \"lr\\|clip\" configs/%s.yaml" % ds)
+        line("%s%d:%s  learning_rate: %s" % (GREEN, ri(8, 20), R, random.choice(["0.1", "0.05", "3e-2"])))
+        line("%s%d:%s  grad_clip: null" % (GREEN, ri(21, 30), R))
+        type_cmd("vim configs/%s.yaml" % ds)
+        out("\033[?1049h\033[2J\033[H")
+        S.alt = True
+        nap(0.5)
+        for i, t in enumerate(["trainer:", "  epochs: 12", "  precision: 16-mixed", "  learning_rate: 3e-4  # lowered from 3e-2", "  grad_clip: 1.0", "  warmup_steps: 500", "  seed: 42"], 1):
+            out("%s%3d %s" % (GREY, i, R))
+            type_text(t, base=0.03)
+            out("\n")
+            nap(0.1, 0.4)
+        nap(0.8)
+        out("\033[%d;1H\033[K:" % term_h())
+        type_text("wq", base=0.2)
+        nap(0.4)
+        _alt_off()
+
+    return [first, tweak, lambda: sc_train(False, ds), lambda: _commit_push("tune(trainer): lower lr and clip grads for %s" % ds)]
+
+
+def arc_intrusion():
+    holder = {}
+    bad = "%d.%d.%d.%d" % (random.choice([45, 61, 103, 185, 193, 218]), ri(1, 254), ri(1, 254), ri(1, 254))
+
+    def watch():
+        sc_fail2ban(bad)
+
+    def count():
+        type_cmd("sudo grep -c 'Failed password' /var/log/auth.log")
+        ask("Password:", secret=True, wait=(4.0, 7.0))
+        line(str(ri(300, 4200)))
+        type_cmd("sudo awk '/Failed password/ {print $(NF-3)}' /var/log/auth.log | sort | uniq -c | sort -rn | head -4")
+        line("%7d %s" % (ri(300, 2000), bad), 0.1)
+        for _ in range(3):
+            line("%7d %d.%d.%d.%d" % (ri(4, 90), ri(40, 220), ri(1, 254), ri(1, 254), ri(1, 254)), 0.1)
+
+    def ban():
+        type_cmd("sudo fail2ban-client set sshd banip %s" % bad)
+        line("1")
+        type_cmd("sudo fail2ban-client status sshd")
+        line("Status for the jail: sshd")
+        line("|- Filter")
+        line("|  |- Currently failed:\t%d" % ri(0, 6))
+        line("|  |- Total failed:\t%d" % ri(800, 9000))
+        line("|  `- File list:\t/var/log/auth.log")
+        line("`- Actions")
+        line("   |- Currently banned:\t%d" % ri(2, 30))
+        line("   |- Total banned:\t%d" % ri(40, 400))
+        line("   `- Banned IP list:\t%s %s" % (bad, " ".join("%d.%d.%d.%d" % (ri(40, 220), ri(1, 254), ri(1, 254), ri(1, 254)) for _ in range(3))))
+
+    return [watch, count, ban]
+
+
+def arc_slowquery():
+    holder = {}
+
+    def one():
+        db = pg_connect()
+        type_cmd("EXPLAIN (ANALYZE) SELECT * FROM orders WHERE customer_id = %d AND created_at > now() - interval '30 days';" % ri(1000, 90000))
+        nap(0.5, 1)
+        line("                                              QUERY PLAN")
+        line("-" * 100)
+        holder["t"] = explain_plan(False, ri(40000, 900000))
+
+    def idx():
+        type_cmd("CREATE INDEX CONCURRENTLY idx_orders_customer_created ON orders (customer_id, created_at DESC);")
+        spin(lambda: "building index", 3.5)
+        line("CREATE INDEX")
+
+    def two():
+        type_cmd("EXPLAIN (ANALYZE) SELECT * FROM orders WHERE customer_id = %d AND created_at > now() - interval '30 days';" % ri(1000, 90000))
+        nap(0.4, 0.8)
+        line("                                              QUERY PLAN")
+        line("-" * 100)
+        explain_plan(True, 100)
+        pg_leave()
+
+    return [one, idx, two]
+
+
+ARCS = [(arc_incident, None), (arc_red_tests, {"python", "node", "rust", "data", "sec"}), (arc_vuln, None),
+        (arc_lockout, {"it"}), (arc_dns, {"it", "infra"}), (arc_diverge, {"data"}), (arc_intrusion, {"sec", "it", "infra"}),
+        (arc_slowquery, None)]
+
+
+def sc_arc():
+    ok = [a for a, st in ARCS if st is None or S.stack in st]
+    steps = random.choice(ok)()
+    first = steps.pop(0)
+    first()
+    S.queue.extend(steps)
+
+
 # ------------------------------------------------------------------- main
 
 # (function, weight, stacks or None for all)
@@ -2745,10 +3887,26 @@ SCENARIOS = [
     (sc_ifconfig, 3, {"it"}), (sc_lsof, 3, {"it"}), (sc_mtr, 4, {"it"}), (sc_subnet_map, 4, {"it"}), (sc_certs, 4, {"it"}),
     (sc_ansible, 5, {"it"}), (sc_macadmin, 3, {"it"}), (sc_cloc, 1, None), (sc_tree, 1, None), (sc_ping, 1, None), (sc_secrets, 3, None),
     (sc_npm, 3, {"node"}), (sc_vite, 2, {"node"}), (sc_jest, 3, {"node"}),
-    (sc_pip, 3, {"python"}), (sc_pytest, 4, {"python"}), (sc_mypy, 2, {"python"}),
-    (sc_python_crash, 2, {"python"}),
+    (sc_pip, 3, {"python", "data", "sec"}), (sc_pytest, 4, {"python", "data", "sec"}), (sc_mypy, 2, {"python", "data", "sec"}),
+    (sc_python_crash, 2, {"python", "data", "sec"}),
     (sc_cargo, 4, {"rust"}), (sc_go, 4, {"go"}),
     (sc_terraform, 4, {"infra"}),
+    # --- v3: databases, pagers, build noise, real identity
+    (sc_whoami, 1, None), (sc_psql, 2, None), (sc_redis, 1, None), (sc_make, 1, None), (sc_xcodebuild, 1, None),
+    (sc_git_graph, 2, None), (sc_man, 2, None), (sc_less, 2, None), (sc_tmux, 2, None),
+    (sc_psql, 3, {"python", "go", "data", "node"}), (sc_redis, 3, {"python", "go", "node", "infra"}),
+    (sc_tmux, 2, {"infra", "it"}), (sc_less, 2, {"infra", "sec"}),
+    # --- data / ML
+    (sc_train, 1, None), (sc_nvidia, 1, None), (sc_notebook, 1, None), (sc_pandas, 1, None), (sc_sklearn, 1, None),
+    (sc_train, 4, {"data"}), (sc_nvidia, 3, {"data"}), (sc_notebook, 4, {"data"}), (sc_pandas, 4, {"data"}), (sc_sklearn, 4, {"data"}),
+    # --- security
+    (sc_trivy, 1, None), (sc_fail2ban, 1, None), (sc_nikto, 1, None), (sc_audit, 1, {"python", "node"}),
+    (sc_trivy, 5, {"sec"}), (sc_fail2ban, 5, {"sec"}), (sc_nikto, 4, {"sec"}), (sc_audit, 4, {"sec"}),
+    (sc_trivy, 2, {"infra"}),
+    # --- cloud / M365 admin
+    (sc_cloudadmin, 1, None), (sc_cloudadmin, 5, {"it"}),
+    # --- story arcs: multi-step narratives
+    (sc_arc, 3, None),
 ]
 INTERACTIVE = [
     (sc_deploy, 3, None), (sc_sudo_brew, 2, None), (sc_merge_conflict, 2, None),
@@ -2756,8 +3914,19 @@ INTERACTIVE = [
 ]
 
 
+ROLES = {"dev": {"node", "python", "rust", "go"}, "it": {"it"}, "data": {"data"}, "sec": {"sec"}, "ops": {"infra"}}
+ROLE_BOOST = {
+    "it": {"sc_pssession", "sc_cloudadmin", "sc_dig", "sc_nmap", "sc_mtr", "sc_tcpdump", "sc_openssl", "sc_subnet_map", "sc_certs", "sc_ansible", "sc_macadmin", "sc_ifconfig", "sc_whoami"},
+    "sec": {"sc_trivy", "sc_fail2ban", "sc_nikto", "sc_audit", "sc_nmap", "sc_tcpdump", "sc_openssl", "sc_secrets", "sc_certs", "sc_lsof"},
+    "data": {"sc_train", "sc_nvidia", "sc_notebook", "sc_pandas", "sc_sklearn", "sc_psql", "sc_areachart", "sc_heatmap"},
+    "dev": {"sc_git_pull", "sc_git_commit_push", "sc_editor", "sc_npm", "sc_jest", "sc_pytest", "sc_cargo", "sc_go", "sc_make", "sc_xcodebuild", "sc_git_graph", "sc_gh_run", "sc_psql", "sc_redis", "sc_arc"},
+    "ops": {"sc_kubectl", "sc_terraform", "sc_logs", "sc_docker_stats", "sc_redis", "sc_psql", "sc_htop", "sc_tmux", "sc_arc", "sc_trivy"},
+}
+
+
 def pick(table):
-    ok = [(f, w) for f, w, st in table
+    boost = ROLE_BOOST.get(S.role, ())
+    ok = [(f, w * (3 if getattr(f, "__name__", "") in boost else 1)) for f, w, st in table
           if (st is None or S.stack in st) and getattr(f, "__name__", "") + str(id(f)) not in S.recent]
     fns, ws = zip(*ok)
     f = random.choices(fns, ws)[0]
@@ -2770,7 +3939,14 @@ def main():
     ap = argparse.ArgumentParser(description="Look busy. Everything is fake and harmless.")
     ap.add_argument("--speed", type=float, default=1.0, help="2 = twice as fast, 0.5 = slower")
     ap.add_argument("--seed", type=int, help="repeatable randomness")
+    ap.add_argument("--role", choices=["all", "dev", "it", "data", "sec", "ops"], default="all",
+                    help="what kind of work to look like doing (default: a bit of everything)")
     args = ap.parse_args()
+    S.role = args.role
+    if args.role != "all":
+        PROJECTS[:] = [p for p in PROJECTS if p[1] in ROLES[args.role]]
+    if hasattr(signal, "SIGWINCH"):
+        signal.signal(signal.SIGWINCH, _on_winch)
     SPEED = max(0.05, args.speed)
     if args.seed is not None:
         random.seed(args.seed)
